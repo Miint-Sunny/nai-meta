@@ -16,8 +16,8 @@
 依赖 Pillow + numpy + prompt_toolkit（TUI 用），全是纯 Python，用 uv 管理，**不用自己建 venv**：
 
 ```bash
-cd ~/code/py-nai
-uv tool install .            # 装成全局命令，uv 给它建独立隔离环境
+uv tool install git+https://github.com/Miint-Sunny/pynai   # 装成全局命令，uv 给它建独立隔离环境
+# 或者克隆后在仓库里：uv tool install .
 ```
 
 改了代码或命令名之后：
@@ -47,7 +47,7 @@ Windows 上的几个差异都在工具里处理掉了：
   `PYNAI_ASCII=1` 或 `=0` 可强制。
 - 带空格的路径照常加引号。
 
-不想装也能一次性跑：`uvx --from <路径或 git 地址> naii a.png`。
+不想装也能一次性跑：`uvx --from git+https://github.com/Miint-Sunny/pynai naii a.png`。
 
 ## naii / nai i / nai-inspect
 
@@ -89,13 +89,18 @@ nsfw, lowres, ...
 hat
 ```
 
-- **类型**：文生图 / 图生图 i2i / 局部重绘 inpaint，后两种带强度和噪声。
+- **类型**：文生图 / 图生图 i2i / 局部重绘 inpaint / 增强 Enhance / 导演工具（emotion、lineart 等，带 defry），
+  i2i 系带强度和噪声。
 - **附加**：Vibe Transfer、角色参考、ControlNet，有几个列几个，带强度。
 - **开关**：只列打开的：Variety+、Decrisper、SMEA、质量标签、UC 预设、透明背景、Upscale、角色坐标。
 - **角色区块**按 NAI 的角色序号编号，负面区块的「角色 2」就是正向的「角色 2」；开了角色坐标时标出位置。
 - 尺寸与文件实际尺寸不一致时（放大过）两个都显示。`-f` 把 Comment 里的全部字段也打出来。
 
-文本块和隐写都是 NAI 数据但内容不一致时会标 ⚠ 并列出差异字段。
+文本块和隐写都是 NAI 数据但内容不一致时会标 ⚠ 并列出差异字段（隐写层本来就不存 vibe 参考图这类大字段，
+两层各自签名，这些正常差异不算）。
+
+不是 NAI 的图也尽量认：A1111 / Forge 那种 `parameters` 文本（PNG 文本块或 EXIF UserComment 里的）解析成同样的版式，
+ComfyUI 工作流报节点数，`-f` 看全文。
 
 ## nais / nai s / nai-strip
 
@@ -207,3 +212,13 @@ tests/test_tui.py        拖拽路径解析、文件夹 y/N、设置持久化、
 ```
 
 跑测试：`uv run pytest`
+
+## 实测覆盖
+
+本机 900 多张真图跑过：NovelAI V4 / V4.5 / V5 全部 14 个模型哈希、文生图 / i2i / inpaint / Enhance / 导演工具、
+vibe transfer、角色参考、被转发剥掉文本块只剩隐写的图、A1111 / ComfyUI / 相机 JPEG，零崩溃；剥离后 PNG 像素逐位相同、
+JPEG 扫描数据逐字节相同。NAI 网站的 WebP 下载没有真样本，只用 Pillow 合成图验证过。Windows 没有真机测试。
+
+## 许可
+
+MIT。

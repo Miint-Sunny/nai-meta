@@ -18,7 +18,7 @@ from PIL import Image
 from PIL.ExifTags import IFD, TAGS
 
 from .core import (COLOR_TYPES, SYM, diff_meta, expand_comment, find_stealth, is_nai,
-                   iter_images, meta_from_text, num, scan_png, setup_console, summarize)
+                   iter_images, meta_from_text, num, parse_a1111, scan_png, setup_console, summarize)
 
 
 # ---------------------------------------------------------------- 取数
@@ -112,7 +112,10 @@ def choose_meta(rec: dict, prefer: str) -> tuple[dict | None, str | None]:
         return text_meta, '文本块'
     if is_nai(st_meta):
         return st_meta, '隐写'
-    # EXIF UserComment / ImageDescription / JPEG 注释里的 JSON
+    a1111 = parse_a1111((rec.get('text_chunks') or {}).get('parameters', ''))
+    if a1111:
+        return a1111, '文本块 parameters'
+    # EXIF UserComment / ImageDescription / JPEG 注释里的 JSON 或 A1111 参数
     for src, s in (('EXIF', (rec.get('exif') or {}).get('UserComment')),
                    ('EXIF', (rec.get('exif') or {}).get('ImageDescription')),
                    ('注释', rec.get('comment'))):
@@ -163,6 +166,20 @@ def _meta_line(rec: dict, src: str | None) -> str:
     return _lab('元数据') + ' · '.join(parts)
 
 
+def _describe_chunk(key: str, text: str, full: bool) -> str:
+    if not full:
+        if key in ('workflow', 'prompt'):
+            try:
+                d = json.loads(text)
+                nodes = d.get('nodes') if isinstance(d, dict) and 'nodes' in d else d
+                return f'{key}: ComfyUI 工作流，{len(nodes)} 个节点（-f 看全文）'
+            except (json.JSONDecodeError, TypeError, AttributeError):
+                pass
+        if key.startswith(('XML:', 'Raw profile')) or len(text) > 600:
+            return f'{key}: {len(text)} 字符（-f 看全文）'
+    return f'{key}:\n{text}'
+
+
 def render(rec: dict, prefer: str, full: bool, raw: bool) -> str:
     W = _width()
     L = [f"{SYM['bar']} {rec['file']}"]
@@ -175,10 +192,8 @@ def render(rec: dict, prefer: str, full: bool, raw: bool) -> str:
     L.append(_meta_line(rec, src))
     tc = rec.get('text_chunks') or {}
     if meta is None:
-        if tc:                                   # 不是 NAI 的文本块（A1111 的 parameters 之类），原样给
-            for k, v in tc.items():
-                L.append(f'{k}:')
-                L.append(v if full else v[:600] + ('…' if len(v) > 600 else ''))
+        for k, v in tc.items():                  # 不是 NAI 也不是 A1111 的文本块：能认的报一句，其余原样给
+            L.append(_describe_chunk(k, v, full))
         if rec.get('exif'):
             L.append('EXIF:')
             for k, v in rec['exif'].items():
@@ -193,7 +208,8 @@ def render(rec: dict, prefer: str, full: bool, raw: bool) -> str:
     rows.append(('模型', ' · '.join(x for x in (mdl['name'], f"哈希 {mdl['hash']}" if mdl['hash'] else None) if x)
                  or mdl['source'] or '?'))
     t = p['type']
-    rows.append(('类型', t['label'] + ''.join(f' · {lab} {num(t[k])}' for k, lab in (('strength', '强度'), ('noise', '噪声')) if k in t)))
+    rows.append(('类型', t['label'] + ''.join(f' · {lab} {num(t[k])}' for k, lab in
+                                             (('strength', '强度'), ('noise', '噪声'), ('defry', 'defry')) if k in t)))
     if p['addons']:
         rows.append(('附加', ' · '.join(f"{a['label']}（{a['detail']}）" if a['detail'] else a['label']
                                         for a in p['addons'])))

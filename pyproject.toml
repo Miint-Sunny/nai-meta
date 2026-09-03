@@ -3,6 +3,8 @@ name = "pynai"
 version = "0.1.0"
 description = "NovelAI 图片元数据小工具：读取 / 剥离 PNG 文本块与 LSB 隐写"
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.10"
 dependencies = [
     "pillow>=10",
@@ -17,6 +19,9 @@ naii = "pynai.nai_inspect:main"
 nais = "pynai.nai_strip:main"
 nai-inspect = "pynai.nai_inspect:main"
 nai-strip = "pynai.nai_strip:main"
+
+[project.urls]
+Repository = "https://github.com/Miint-Sunny/pynai"
 
 [dependency-groups]
 dev = ["pytest>=8"]

@@ -149,7 +149,7 @@ def meta_from_text(s: str) -> dict | None:
     try:
         d = json.loads(s)
     except (json.JSONDecodeError, TypeError):
-        return None
+        return parse_a1111(s) if isinstance(s, str) else None
     if not isinstance(d, dict):
         return None
     if 'Comment' in d:
@@ -172,8 +172,61 @@ REQUEST_TYPES = {
     'PromptGenerateRequest': ('txt2img', '文生图'),
     'Img2ImgRequest': ('img2img', '图生图 i2i'),
     'NativeInfillingRequest': ('inpaint', '局部重绘 inpaint'),
+    'A1111': ('a1111', 'WebUI 文生图（A1111 格式）'),
+    'A1111-img2img': ('a1111_img2img', 'WebUI 图生图（A1111 格式）'),
+}
+STRENGTH_KINDS = ('img2img', 'inpaint', 'enhance', 'a1111_img2img')
+# 模型哈希 → 名字。Source 缺失或写成枚举名（见过 "DiffusionModelMetaName.NAIv4next"）时兜底；
+# 除 V3 外都是从本机 900 多张图里统计出来的
+KNOWN_MODEL_HASHES = {
+    'C1E1DE52': 'NovelAI Diffusion V3',
+    'F6E18726': 'NovelAI Diffusion V4', '79F47848': 'NovelAI Diffusion V4', '4F49EC75': 'NovelAI Diffusion V4',
+    'C1CCBA86': 'NovelAI Diffusion V4', '37442FCA': 'NovelAI Diffusion V4',
+    '4BDE2A90': 'NovelAI Diffusion V4.5', '1229B44F': 'NovelAI Diffusion V4.5',
+    'C02D4F98': 'NovelAI Diffusion V4.5', '5BB76870': 'NovelAI Diffusion V4.5',
+    '0ADF9AB7': 'NovelAI Diffusion V5', '657484A5': 'NovelAI Diffusion V5', 'DB276663': 'NovelAI Diffusion V5',
 }
 _HASH_RE = re.compile(r'\s+([0-9A-Fa-f]{8})$')
+_A1111_KV = re.compile(r'\s*([A-Za-z][\w ]*?):\s*("(?:[^"\\]|\\.)*"|[^,]*)(?:,|$)')
+
+
+def parse_a1111(text: str) -> dict | None:
+    """Stable Diffusion WebUI（A1111 / Forge，很多工具沿用）的 parameters 文本 → 伪 NAI 元数据，
+    好让摘要和版式复用。格式：
+        正向提示词
+        Negative prompt: 负面
+        Steps: 28, Sampler: Euler a, CFG scale: 7, Seed: 1, Size: 512x768, Model hash: abc, Model: xyz"""
+    if not text or 'Steps:' not in text:
+        return None
+    lines = text.strip().split('\n')
+    idx = max(i for i, ln in enumerate(lines) if 'Steps:' in ln)
+    head, param_line = lines[:idx], lines[idx]
+    neg = next((i for i, ln in enumerate(head) if ln.startswith('Negative prompt:')), None)
+    if neg is None:
+        prompt, uc = '\n'.join(head).strip(), ''
+    else:
+        prompt = '\n'.join(head[:neg]).strip()
+        uc = '\n'.join([head[neg][len('Negative prompt:'):]] + head[neg + 1:]).strip()
+    kv = {k.strip(): v.strip().strip('"') for k, v in _A1111_KV.findall(param_line)}
+
+    def f(key, cast):
+        v = kv.get(key)
+        try:
+            return cast(v) if v not in (None, '') else None
+        except ValueError:
+            return v
+
+    size = kv.get('Size', '').lower()
+    w, h = (size.split('x', 1) + [''])[:2] if 'x' in size else ('', '')
+    c = {'prompt': prompt, 'uc': uc, 'steps': f('Steps', int), 'sampler': kv.get('Sampler'),
+         'noise_schedule': kv.get('Schedule type'), 'scale': f('CFG scale', float), 'seed': f('Seed', int),
+         'width': int(w) if w.isdigit() else None, 'height': int(h) if h.isdigit() else None,
+         'model_name': kv.get('Model'), 'model_hash': kv.get('Model hash'), 'request_type': 'A1111',
+         'a1111_params': kv}
+    if kv.get('Denoising strength'):
+        c['strength'] = f('Denoising strength', float)
+        c['request_type'] = 'A1111-img2img'
+    return {'Software': 'Stable Diffusion WebUI', 'Comment': c}
 
 
 def num(v) -> str:
@@ -205,18 +258,29 @@ def summarize(meta: dict) -> dict:
     # 模型：Source 形如 "NovelAI Diffusion V5 0ADF9AB7"，末尾 8 位十六进制是模型哈希
     source = str(meta.get('Source') or '')
     m = _HASH_RE.search(source)
-    model = {'name': c.get('model_name') or (source[:m.start()] if m else source) or None,
-             'hash': c.get('model_hash') or (m.group(1) if m else None),
-             'source': source or None, 'software': meta.get('Software')}
+    mhash = c.get('model_hash') or (m.group(1) if m else None)
+    mname = c.get('model_name') or (source[:m.start()] if m else source) or None
+    if mhash and (not mname or mname.startswith('DiffusionModel')):
+        mname = KNOWN_MODEL_HASHES.get(mhash.upper(), mname)
+    model = {'name': mname, 'hash': mhash, 'source': source or None, 'software': meta.get('Software')}
 
-    # 生图类型：request_type 分文生图 / i2i / inpaint；i2i 和 inpaint 才看 strength、noise
+    # 生图类型：request_type 分文生图 / i2i / inpaint；Enhance 是带 upscaled_enhance 的 i2i；
+    # Director Tools（emotion / lineart / colorize …）走 req_type + defry
     rt = c.get('request_type')
     kind, label = REQUEST_TYPES.get(rt, (rt or 'unknown', rt or '未知'))
     gtype = {'kind': kind, 'label': label, 'request_type': rt}
-    if kind in ('img2img', 'inpaint'):
+    if c.get('req_type'):
+        gtype.update(kind='director_tool', label=f"导演工具 {c['req_type']}", req_type=c['req_type'])
+        if c.get('defry') is not None:
+            gtype['defry'] = c['defry']
+    elif c.get('upscaled_enhance'):
+        gtype.update(kind='enhance', label='增强 Enhance')
+    if gtype['kind'] in STRENGTH_KINDS:
+        sub = c.get('img2img') if isinstance(c.get('img2img'), dict) else {}   # V4.5 inpaint 把这些塞在子字典里
         for k in ('strength', 'noise'):
-            if c.get(k) is not None:
-                gtype[k] = c[k]
+            v = c[k] if c.get(k) is not None else sub.get(k)
+            if v is not None:
+                gtype[k] = v
 
     # 附加功能：Vibe Transfer / 角色参考 / ControlNet，任何类型都可能叠加
     addons = []
@@ -289,7 +353,13 @@ def diff_meta(a: dict, b: dict) -> list[str]:
             out.append(k)
     ca, cb = a.get('Comment'), b.get('Comment')
     if isinstance(ca, dict) and isinstance(cb, dict):
-        out += [f'Comment.{k}' for k in sorted(set(ca) | set(cb)) if ca.get(k) != cb.get(k)]
+        for k in sorted(set(ca) | set(cb)):
+            va, vb = ca.get(k), cb.get(k)
+            # 两层各自签名，signed_hash 本来就不同；隐写层不存参考图这类大字段（写成 None），一边缺失不算冲突
+            if k == 'signed_hash' or va is None or vb is None:
+                continue
+            if va != vb:
+                out.append(f'Comment.{k}')
     elif ca != cb:
         out.append('Comment')
     return out
