@@ -2,7 +2,7 @@
 """真图里见到的各种情况：两层正常差异、枚举 Source、Enhance、Director Tools、inpaint 子字典、A1111 格式。"""
 import json
 
-from pynai.core import diff_meta, meta_from_text, parse_a1111, summarize
+from nai_meta.core import diff_meta, meta_from_text, parse_a1111, summarize
 
 BASE = {'prompt': '1girl', 'uc': 'lowres', 'seed': 1, 'steps': 28, 'scale': 5.0, 'sampler': 'k_euler_ancestral',
         'noise_schedule': 'karras', 'width': 832, 'height': 1216, 'request_type': 'PromptGenerateRequest'}

@@ -37,7 +37,7 @@ def main(argv=None) -> int:
         print(usage())
         return 0
     if argv[0] in ('-V', '--version'):
-        print(f'pynai {__version__}')
+        print(f'nai-meta {__version__}')
         return 0
     for names, fn, _ in COMMANDS:
         if argv[0] in names:

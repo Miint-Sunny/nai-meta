@@ -1,4 +1,4 @@
-# pynai — NovelAI 图片元数据小工具
+# nai-meta — NovelAI 图片元数据小工具
 
 两个功能，像素一个都不动，每个功能三种叫法随便用：
 
@@ -8,7 +8,7 @@
 | `nais` | `nai s` | `nai-strip` | 剥掉元数据：PNG 文本块 / eXIf / tIME / LSB 隐写；JPEG 按段无损剥 EXIF、XMP、注释 |
 
 `nai` 是伞形总入口，不带参数打印用法，`nai -V` 看版本。以后的生图 agent 之类也挂在它下面
-（`src/pynai/cli.py` 的 `COMMANDS` 加一行即可，`gen` / `agent` 这两个名字先留着）。
+（`src/nai_meta/cli.py` 的 `COMMANDS` 加一行即可，`gen` / `agent` 这两个名字先留着）。
 命令名都在 `pyproject.toml` 的 `[project.scripts]` 里，左边就是命令名，改完 `uv tool install . --reinstall`。
 
 ## 安装
@@ -16,7 +16,7 @@
 依赖 Pillow + numpy + prompt_toolkit（TUI 用），全是纯 Python，用 uv 管理，**不用自己建 venv**：
 
 ```bash
-uv tool install git+https://github.com/Miint-Sunny/pynai   # 装成全局命令，uv 给它建独立隔离环境
+uv tool install git+https://github.com/Miint-Sunny/nai-meta   # 装成全局命令，uv 给它建独立隔离环境
 # 或者克隆后在仓库里：uv tool install .
 ```
 
@@ -27,7 +27,7 @@ uv tool install . --reinstall
 ```
 
 开发期不装也能跑：`uv run naii a.png`（uv 自动建 `.venv` 并同步依赖）。
-卸载：`uv tool uninstall pynai`。
+卸载：`uv tool uninstall nai-meta`。
 
 ### Windows
 
@@ -44,10 +44,10 @@ Windows 上的几个差异都在工具里处理掉了：
 - **通配符**：cmd / PowerShell 不替外部程序展开 `*.png`，工具自己展开，`**` 也认。
 - **输出编码**：stdout 重定向到文件时默认 GBK，✔ ▸ 会报错；工具启动时把 stdout 强制成 UTF-8。
 - **符号**：老式 cmd / PowerShell 窗口字体常缺 ✔ ✗ ▸ ⚠，非 Windows Terminal 时自动换成 √ × > !。
-  `PYNAI_ASCII=1` 或 `=0` 可强制。
+  `NAI_META_ASCII=1` 或 `=0` 可强制。
 - 带空格的路径照常加引号。
 
-不想装也能一次性跑：`uvx --from git+https://github.com/Miint-Sunny/pynai naii a.png`。
+不想装也能一次性跑：`uvx --from git+https://github.com/Miint-Sunny/nai-meta naii a.png`。
 
 ## naii / nai i / nai-inspect
 
@@ -153,8 +153,8 @@ nais tui              # 或 nai s tui / nai-strip tui；nais tui ./干净 = 进�
 | `/help` `/q` | 说明 / 退出（Ctrl-D 也行） |
 
 Tab 补全路径，↑↓ 翻历史。退出时记住输出目录、后缀、alpha / ICC / 递归这些设置
-（原地覆盖和 dry-run 故意不记，每次进来都从安全状态开始），存在 `~/.config/pynai/tui.json`，
-Windows 在 `%APPDATA%\pynai\`。
+（原地覆盖和 dry-run 故意不记，每次进来都从安全状态开始），存在 `~/.config/nai-meta/tui.json`，
+Windows 在 `%APPDATA%\nai-meta\`。
 
 ### 具体做了什么
 
@@ -201,11 +201,11 @@ NAI 出图时把同一份元数据写了两遍：
 
 ```
 pyproject.toml           依赖 + 命令名
-src/pynai/core.py        共用：PNG 块扫描、隐写读/擦、参数整理、跨平台杂项
-src/pynai/nai_inspect.py naii / nai-inspect
-src/pynai/nai_strip.py   nais / nai-strip
-src/pynai/cli.py         nai 伞形总入口（nai i / nai s，以后的 agent 也挂这）
-src/pynai/tui.py         nais tui 交互模式
+src/nai_meta/core.py        共用：PNG 块扫描、隐写读/擦、参数整理、跨平台杂项
+src/nai_meta/nai_inspect.py naii / nai-inspect
+src/nai_meta/nai_strip.py   nais / nai-strip
+src/nai_meta/cli.py         nai 伞形总入口（nai i / nai s，以后的 agent 也挂这）
+src/nai_meta/tui.py         nais tui 交互模式
 tests/test_roundtrip.py  合成带隐写 / 文本块 / EXIF 的图，读 → 剥 → 验证
 tests/test_cli.py        总入口分发、通配符展开
 tests/test_tui.py        拖拽路径解析、文件夹 y/N、设置持久化、命令行确认

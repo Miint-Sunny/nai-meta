@@ -3,8 +3,8 @@
 import numpy as np
 from PIL import Image
 
-from pynai.cli import main as nai
-from pynai.core import iter_images
+from nai_meta.cli import main as nai
+from nai_meta.core import iter_images
 
 
 def _png(path):
@@ -28,7 +28,7 @@ def test_dispatch_errors(capsys):
     assert '子命令' in capsys.readouterr().out
     assert nai(['bogus']) == 2
     assert nai(['-V']) == 0
-    assert capsys.readouterr().out.startswith('pynai ')
+    assert capsys.readouterr().out.startswith('nai-meta ')
 
 
 def test_glob_expansion(tmp_path):

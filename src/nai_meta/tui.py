@@ -49,7 +49,7 @@ def config_dir() -> Path:
         base = Path(os.environ.get('APPDATA') or Path.home() / 'AppData' / 'Roaming')
     else:
         base = Path(os.environ.get('XDG_CONFIG_HOME') or Path.home() / '.config')
-    return base / 'pynai'
+    return base / 'nai-meta'
 
 
 def load_settings() -> dict:

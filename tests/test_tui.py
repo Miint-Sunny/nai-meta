@@ -9,15 +9,15 @@ from prompt_toolkit.input import create_pipe_input
 from prompt_toolkit.output import DummyOutput
 from test_roundtrip import nai_png
 
-from pynai.nai_strip import main as strip_main
-from pynai.tui import parse_paths, run_tui
+from nai_meta.nai_strip import main as strip_main
+from nai_meta.tui import parse_paths, run_tui
 
 
 @pytest.fixture
 def cfg(tmp_path, monkeypatch):
     monkeypatch.setenv('XDG_CONFIG_HOME', str(tmp_path / 'cfg'))
     monkeypatch.setenv('APPDATA', str(tmp_path / 'cfg'))
-    return tmp_path / 'cfg' / 'pynai'
+    return tmp_path / 'cfg' / 'nai-meta'
 
 
 def drive(text: str) -> int:

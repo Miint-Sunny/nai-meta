@@ -7,9 +7,9 @@ import numpy as np
 from PIL import Image
 from test_roundtrip import META, assert_clean, embed, random_rgba
 
-from pynai.core import find_stealth
-from pynai.nai_strip import main as strip_main
-from pynai.nai_strip import webp_chunks
+from nai_meta.core import find_stealth
+from nai_meta.nai_strip import main as strip_main
+from nai_meta.nai_strip import webp_chunks
 
 
 def _stealth_rgba(transparent=False):

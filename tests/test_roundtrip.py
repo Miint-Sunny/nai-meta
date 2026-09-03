@@ -7,9 +7,9 @@ import numpy as np
 import pytest
 from PIL import Image, PngImagePlugin
 
-from pynai.core import find_stealth, scan_png
-from pynai.nai_inspect import inspect_file
-from pynai.nai_strip import main as strip_main
+from nai_meta.core import find_stealth, scan_png
+from nai_meta.nai_inspect import inspect_file
+from nai_meta.nai_strip import main as strip_main
 
 COMMENT = {'prompt': '1girl, solo', 'uc': 'lowres', 'seed': 42, 'steps': 28, 'scale': 5.0,
            'sampler': 'k_euler_ancestral', 'noise_schedule': 'karras', 'width': 64, 'height': 48,
@@ -82,7 +82,7 @@ def test_inspect_reads_both_layers(tmp_path):
     assert set(rec['text_chunks']) == {'Description', 'Software', 'Source', 'Generation time', 'Comment', 'Title'}
     assert rec['stealth']['channel'] == 'alpha' and rec['stealth']['compressed']
     assert rec['consistent'] is True
-    from pynai.core import summarize
+    from nai_meta.core import summarize
     s = summarize(rec['text_meta'])
     assert s['seed'] == 42 and s['prompt'] == '1girl, solo'
     assert s['char_prompts'][0]['caption'] == 'red hair'

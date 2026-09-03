@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""pynai 共用逻辑：PNG 块扫描、LSB 隐写读/擦、NAI 元数据整理。
+"""nai-meta 共用逻辑：PNG 块扫描、LSB 隐写读/擦、NAI 元数据整理。
 
 NAI 出图时把同一份元数据写了两遍：
 
@@ -477,8 +477,8 @@ def setup_console() -> None:
 
 def _plain_symbols() -> bool:
     """老式 cmd / PowerShell 窗口的字体常缺 ✔ ▸ ⚠，用 GBK 里有的 √ × > ! 代替。
-    Windows Terminal（有 WT_SESSION 环境变量）不用降级。PYNAI_ASCII=1/0 可强制。"""
-    flag = os.environ.get('PYNAI_ASCII')
+    Windows Terminal（有 WT_SESSION 环境变量）不用降级。NAI_META_ASCII=1/0 可强制。"""
+    flag = os.environ.get('NAI_META_ASCII')
     if flag is not None:
         return flag not in ('0', '')
     return os.name == 'nt' and not os.environ.get('WT_SESSION')
