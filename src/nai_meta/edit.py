@@ -215,3 +215,52 @@ def ask(text: str) -> str:
         return PromptSession(style=STYLE).prompt(HTML(f'<warn>{html.escape(text)}</warn>')).strip()
     except (EOFError, KeyboardInterrupt):
         return ''
+
+
+# ---------------------------------------------------------------- 改词表（-w）
+WORDS_HELP = '旧=新 添加或改一条 · -旧 或 -编号 删一条 · :w 保存 · :q 取消 · 回车重看。匹配不分大小写、按子串；旧写成 /正则/ 则按正则'
+
+
+def show_words(rules: dict) -> None:
+    if not rules:
+        say('（空）', 'dim')
+    for i, (k, v) in enumerate(rules.items(), 1):
+        say(f'{i:>3}  {k}  →  {v}')
+    say(WORDS_HELP, 'dim')
+
+
+def edit_words_interactive(name: str, rules: dict) -> dict | None:
+    rules = dict(rules)
+    session = PromptSession(style=STYLE)
+    say(f'{SYM["bar"]} 编辑改词表 {name}', 'prompt')
+    show_words(rules)
+    while True:
+        try:
+            line = session.prompt(HTML('<prompt>words</prompt> <dim>›</dim> ')).strip()
+        except (EOFError, KeyboardInterrupt):
+            return None
+        if not line:
+            show_words(rules)
+        elif line in (':w', ':wq', 'w'):
+            return rules
+        elif line in (':q', ':q!', 'q'):
+            return None
+        elif line.startswith('-') and len(line) > 1:
+            key = line[1:].strip()
+            if key.isdigit() and 1 <= int(key) <= len(rules):
+                key = list(rules)[int(key) - 1]
+            if key in rules:
+                del rules[key]
+                say(f'删了 {key}', 'dim')
+            else:
+                say(f'没有 {key}', 'bad')
+        elif '=' in line:
+            k, _, v = line.partition('=')
+            k, v = k.strip(), v.strip()
+            if not k:
+                say('旧词不能为空', 'bad')
+                continue
+            rules[k] = v
+            say(f'{k} → {v}', 'dim')
+        else:
+            say('不认识这个；' + WORDS_HELP, 'bad')

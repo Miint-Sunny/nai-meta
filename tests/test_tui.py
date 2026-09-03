@@ -81,3 +81,12 @@ def test_cli_folder_asks_and_respects_answer(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr('builtins.input', lambda _prompt: pytest.fail('不该问'))
     assert strip_main([str(d), '-y', '--overwrite']) == 0
     assert strip_main([str(d / 'b.png'), '--overwrite']) == 0
+
+
+def test_absolute_path_without_spaces_is_not_a_command(tmp_path, cfg):
+    """macOS 拖进来的路径是 /Users/... 开头，之前被当成命令吞掉了。"""
+    src = tmp_path / 'a.png'
+    nai_png(src)
+    assert ' ' not in str(src)
+    assert drive(f'{src}\n/q\n') == 0
+    assert (tmp_path / 'a_clean.png').exists()

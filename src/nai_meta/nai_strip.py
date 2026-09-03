@@ -29,7 +29,7 @@ from PIL.PngImagePlugin import PngInfo
 
 from .core import (GLOB_CHARS, SYM, confirm, config_dir, embed_stealth, expand_comment, fill_meta, find_stealth,
                    fmt_size, is_nai, iter_images, load_meta_json, make_meta, meta_to_exif, meta_to_text, parse_set,
-                   scan_png, setup_console, stealth_payload, wipe_stealth)
+                   scan_png, setup_console, stealth_payload, substitute_strings, wipe_stealth)
 
 
 # ---------------------------------------------------------------- PNG / 通用（像素路线）
@@ -201,7 +201,7 @@ def webp_with_exif(data: bytes, exif: bytes, size: tuple[int, int]) -> bytes:
     return build_webp(chunks + [(b'EXIF', tiff)])
 
 
-def plan_webp(src: Path, im: Image.Image, opts, poison: dict | None = None):
+def plan_webp(src: Path, im: Image.Image, opts, poison: dict | None = None, label: str = '写入投毒'):
     """WebP 分三种。VP8L 无损：像素路线，无损重存。VP8 有损 + alpha 全不透明（NAI 出图就是这样，
     隐写藏在无损压缩的 ALPH 块里）：容器层丢掉 ALPH / EXIF / XMP，RGB 数据一字节不动。
     VP8 有损 + 真透明：只能有损重编码。返回 (写文件函数, 做了什么, 提示)。"""
@@ -212,14 +212,14 @@ def plan_webp(src: Path, im: Image.Image, opts, poison: dict | None = None):
     def container(new: bytes, removed: list[str]):
         if poison:                               # 有损 WebP 没有可写隐写的 alpha，只写 EXIF
             new = webp_with_exif(new, meta_to_exif(poison), im.size)
-            removed = removed + ['写入投毒（EXIF）']
+            removed = removed + [f'{label}（EXIF）']
         return (lambda p: p.write_bytes(new)), removed
 
     def pixels(lossless: bool):
         clean, d, n = clean_pixels(im, opts)
         if poison:
             clean = poison_pixels(clean, poison)
-            d.append('写入投毒（EXIF+隐写）')
+            d.append(f'{label}（EXIF+隐写）')
         return (lambda p: save_pixels(clean, im, p, 'WEBP', opts, lossless=lossless, meta=poison)), d, n
 
     if b'ANIM' in tags:
@@ -250,7 +250,8 @@ def plan_webp(src: Path, im: Image.Image, opts, poison: dict | None = None):
 # ---------------------------------------------------------------- 主流程
 DEFAULTS = dict(paths=[], recursive=False, output=None, outdir=None, in_place=False, suffix=None,
                 drop_alpha=False, scrub_all=False, strip_icc=False, overwrite=False, no_verify=False,
-                dry_run=False, yes=False, poison=None, sets={}, poison_meta=None)
+                dry_run=False, yes=False, poison=None, sets={}, poison_meta=None,
+                words=[], word_rules={}, word_presets=[])
 
 
 def make_opts(**overrides) -> Namespace:
@@ -280,13 +281,98 @@ def output_path(src: Path, rel: Path, opts) -> Path:
         return Path(opts.output)
     if opts.outdir:
         return Path(opts.outdir) / rel
-    return src.with_name(src.stem + suffix_of(opts) + src.suffix)
+    return src.with_name(Path(rel.name).stem + suffix_of(opts) + src.suffix)   # rel 可能被 -w 改过词
 
 
 def suffix_of(opts) -> str:
     if opts.suffix:
         return opts.suffix
+    if opts.word_rules:                          # 只用了一个预设就拿预设名当后缀：a_discord.png
+        return f'_{opts.word_presets[0]}' if len(opts.word_presets) == 1 and len(opts.words) == 1 else '_w'
     return '_poison' if (opts.poison or opts.sets) else '_clean'
+
+
+# ---------------------------------------------------------------- 改词（-w）：词表
+BUILTIN_WORDS = {'discord': {'loli': '1011'}}
+
+
+def words_dir() -> Path:
+    return config_dir() / 'words'
+
+
+def words_path(name: str) -> Path:
+    return words_dir() / f'{name}.txt'
+
+
+def parse_words_text(text: str) -> dict:
+    rules = {}
+    for ln in text.splitlines():
+        ln = ln.strip()
+        if not ln or ln.startswith('#') or '=' not in ln:
+            continue
+        k, _, v = ln.partition('=')
+        rules[k.strip()] = v.strip()
+    return rules
+
+
+def load_words(name: str) -> dict | None:
+    """用户文件优先，其次内置；都没有返回 None。"""
+    if words_path(name).exists():
+        return parse_words_text(words_path(name).read_text('utf-8'))
+    return dict(BUILTIN_WORDS[name]) if name in BUILTIN_WORDS else None
+
+
+def save_words(name: str, rules: dict) -> Path:
+    words_dir().mkdir(parents=True, exist_ok=True)
+    p = words_path(name)
+    p.write_text('# 一行一条：旧=新。不分大小写、按子串匹配；旧写成 /正则/ 按正则\n'
+                 + ''.join(f'{k}={v}\n' for k, v in rules.items()), 'utf-8')
+    return p
+
+
+def list_words() -> str:
+    names = sorted({*BUILTIN_WORDS, *(p.stem for p in words_dir().glob('*.txt'))} if words_dir().exists() else set(BUILTIN_WORDS))
+    lines = [f'改词表（{words_dir()}；没有文件的是内置）：']
+    for n in names:
+        rules = load_words(n) or {}
+        src = '' if words_path(n).exists() else '（内置）'
+        lines.append(f'  {n:>10}{src}  ' + ' · '.join(f'{k}→{v}' for k, v in rules.items()))
+    return '\n'.join(lines)
+
+
+def resolve_words(opts) -> int | None:
+    """-w 的写法：旧=新 单条规则；预设名；list；edit 名字 / edit:名字。多个 -w 叠加。返回非 None 表示要直接退出。"""
+    opts.word_rules, opts.word_presets = {}, []
+    for spec in opts.words or []:
+        spec = spec.strip()
+        if spec == 'list':
+            print(list_words())
+            return 0
+        if spec == 'edit' or spec.startswith(('edit:', 'edit ')):
+            from .edit import edit_words_interactive
+            name = spec[4:].lstrip(': ').strip()
+            if not name:
+                print('要写成 -w edit 名字', file=sys.stderr)
+                return 1
+            rules = edit_words_interactive(name, load_words(name) or {})
+            if rules is None:
+                print('已取消')
+                return 1
+            print(f'改词表 {name} 已存到 {save_words(name, rules)}')
+            opts.word_rules.update(rules)
+            opts.word_presets.append(name)
+            continue
+        if '=' in spec:
+            k, _, v = spec.partition('=')
+            opts.word_rules[k.strip()] = v.strip()
+            continue
+        rules = load_words(spec)
+        if rules is None:
+            print(f'没有改词表 {spec}\n{list_words()}', file=sys.stderr)
+            return 1
+        opts.word_rules.update(rules)
+        opts.word_presets.append(spec)
+    return None
 
 
 # ---------------------------------------------------------------- 投毒：预设
@@ -418,6 +504,26 @@ def verify_poison(dst: Path, meta: dict) -> list[str]:
     return problems
 
 
+def verify_words(dst: Path, rules: dict) -> list[str]:
+    """回读所有文本层，确认旧词一个不剩（正则规则不查）。"""
+    from .nai_inspect import inspect_file
+    from .core import compile_rules
+    rec = inspect_file(dst)
+    texts = list((rec.get('text_chunks') or {}).values())
+    if rec.get('stealth'):
+        texts.append(rec['stealth']['raw'])
+    for v in (rec.get('exif') or {}).values():
+        if isinstance(v, str):
+            texts.append(v)
+    left = []
+    for old, _new, pat in compile_rules(rules):
+        if old.startswith('/'):
+            continue
+        if any(pat.search(t) for t in texts):
+            left.append(f'仍有 {old}')
+    return left
+
+
 def verify(dst: Path) -> list[str]:
     """重新打开输出，确认三层都没了。返回残留清单（空 = 干净）。"""
     left = []
@@ -443,17 +549,26 @@ def verify(dst: Path) -> list[str]:
 
 def strip_one(src: Path, rel: Path, opts) -> tuple[bool, str]:
     """返回 (成功?, 报告行)。"""
-    dst = output_path(src, rel, opts)
-    tag = f'{src.name} → {dst if opts.output or opts.outdir else dst.name}' if dst != src else f'{src.name} (原地)'
-    if dst.exists() and dst != src and not opts.overwrite:
-        return False, f'{SYM["bad"]} {tag}   输出已存在，跳过（--overwrite 可覆盖）'
-
     try:
         found, done, notes = [], [], []
         scan = scan_png(src)
         with Image.open(src) as im:
             im.load()
             fmt = im.format or 'PNG'
+            words_meta, hits = None, None
+            if opts.word_rules:                  # -w：不剥，读出原元数据只换词，文件名里的词也换
+                orig = _orig_meta(src, im, scan)
+                if not is_nai(orig):
+                    return True, f'· {src.name}   没有 NAI 元数据，改词没对象，不动'
+                words_meta, hits = substitute_strings(make_meta(orig, sets=opts.sets, size=im.size), opts.word_rules)
+                if not hits:
+                    return True, f'· {src.name}   没命中任何词，不动'
+                rel = rel.with_name(substitute_strings(rel.name, opts.word_rules)[0])
+            dst = output_path(src, rel, opts)
+            tag = f'{src.name} → {dst if opts.output or opts.outdir else dst.name}' if dst != src else f'{src.name} (原地)'
+            if dst.exists() and dst != src and not opts.overwrite:
+                return False, f'{SYM["bad"]} {tag}   输出已存在，跳过（--overwrite 可覆盖）'
+            label = '改词写回' if words_meta else '写入投毒'
             if scan:
                 if scan.texts:
                     found.append(f"文本块 {len(scan.texts)} ({', '.join(scan.texts)})")
@@ -468,7 +583,7 @@ def strip_one(src: Path, rel: Path, opts) -> tuple[bool, str]:
                 if im.info.get(k):
                     found.append(k)
 
-            poison = poison_for(src, im, scan, opts)
+            poison = words_meta if words_meta is not None else poison_for(src, im, scan, opts)
             if fmt == 'JPEG':
                 if opts.scrub_all:
                     notes.append('JPEG 不做像素处理')
@@ -476,10 +591,10 @@ def strip_one(src: Path, rel: Path, opts) -> tuple[bool, str]:
                 done += removed
                 if poison:
                     new_bytes = jpeg_with_exif(new_bytes, meta_to_exif(poison))
-                    done.append('写入投毒（EXIF）')
+                    done.append(f'{label}（EXIF）')
                 writer = lambda p: p.write_bytes(new_bytes)  # noqa: E731
             elif fmt == 'WEBP':
-                writer, done_w, notes_w = plan_webp(src, im, opts, poison)
+                writer, done_w, notes_w = plan_webp(src, im, opts, poison, label)
                 done += done_w
                 notes += notes_w
             else:
@@ -490,7 +605,7 @@ def strip_one(src: Path, rel: Path, opts) -> tuple[bool, str]:
                 notes += notes_px
                 if poison and fmt == 'PNG':
                     clean = poison_pixels(clean, poison)
-                    done.append('写入投毒（文本块+隐写）')
+                    done.append(f'{label}（文本块+隐写）')
                 elif poison:
                     notes.append(f'{fmt} 不写投毒')
                     poison = None
@@ -513,13 +628,19 @@ def strip_one(src: Path, rel: Path, opts) -> tuple[bool, str]:
         if opts.no_verify:
             left = []
         elif poison:
-            left = [f'投毒回读失败: {", ".join(x)}' for x in [verify_poison(dst, poison)] if x]
+            left = [f'回读失败: {", ".join(x)}' for x in [verify_poison(dst, poison)] if x]
+            if words_meta is not None:
+                left += verify_words(dst, opts.word_rules)
         else:
             left = verify(dst)
         size = f'{fmt_size(src.stat().st_size)} → {fmt_size(dst.stat().st_size)}' if dst != src else fmt_size(dst.stat().st_size)
-        # JPEG 按段报告（哪些段、多大）就够了；PNG 报发现的块 + 像素层动作
-        removed = done if fmt in ('JPEG', 'WEBP') else found + [d for d in done if not d.startswith('隐写')]
-        line = f'{SYM["ok"]} {tag}   去掉: {" · ".join(removed) or "无"}   {size}'
+        if words_meta is not None:
+            hit_desc = ' · '.join(f'{k} ×{n}' for k, n in hits.items())
+            line = f'{SYM["ok"]} {tag}   改词: {hit_desc} · {[d for d in done if d.startswith(label)][0] if any(d.startswith(label) for d in done) else label}   {size}'
+        else:
+            # JPEG 按段报告（哪些段、多大）就够了；PNG 报发现的块 + 像素层动作
+            removed = done if fmt in ('JPEG', 'WEBP') else found + [d for d in done if not d.startswith('隐写')]
+            line = f'{SYM["ok"]} {tag}   去掉: {" · ".join(removed) or "无"}   {size}'
         if left:
             line = f'{SYM["bad"]} {tag}   仍有残留: {", ".join(left)}   {size}'
         if notes:
@@ -551,6 +672,9 @@ def main(argv=None) -> int:
         '-t 1 用预设 1；-t edit 在终端里逐字段改，-t edit 1 改并存为预设 1；-t @文件.json 用现成模板；-t list 列预设'))
     ap.add_argument('--set', action='append', default=[], metavar='键=值',
                     help='改单个字段，可重复：--set seed=7 --set uc=lowres；单独用时以原图元数据为底')
+    ap.add_argument('-w', '--words', action='append', default=[], metavar='规则|词表', help=(
+        '不剥元数据，只把命中的词换掉再写回两层（应付平台内容政策）：-w loli=1011 单条规则；-w discord 用词表'
+        '（内置 discord = loli→1011）；-w edit discord 终端里改词表；-w list 列词表。可重复叠加。输出文件名里的词也一并换'))
     ap.add_argument('--drop-alpha', action='store_true', help='alpha 全不透明时去掉 alpha 通道存成 RGB，文件更小')
     ap.add_argument('--scrub-all', action='store_true', help='清掉所有通道所有像素的最低位（应付未知隐写变种；颜色最多变 1/255）')
     ap.add_argument('--strip-icc', action='store_true', help='连 ICC 色彩配置也去掉（默认保留，它不含生成信息）')
@@ -560,6 +684,14 @@ def main(argv=None) -> int:
     ap.add_argument('-y', '--yes', action='store_true', help='处理文件夹 / 通配符时不问 y/N（脚本里用）')
     a = ap.parse_intermixed_args(argv)
     a.sets = a.set
+    if a.words and a.poison:
+        print('-w（只改词）和 -t（投毒）是两种模式，不能同时用', file=sys.stderr)
+        return 1
+    if a.words and a.paths and a.words[-1] == 'edit':      # nais -w edit discord：名字被当成了路径
+        for i in range(len(a.paths) - 1, -1, -1):
+            if not Path(a.paths[i]).exists() and re.fullmatch(r'[\w-]+', a.paths[i]):
+                a.words[-1] = f'edit:{a.paths.pop(i)}'
+                break
     if a.poison == 'edit' and a.paths:               # nais -t edit 1：编号被当成了路径，捞回来
         for i in range(len(a.paths) - 1, -1, -1):
             if not Path(a.paths[i]).exists() and re.fullmatch(r'[\w-]+', a.paths[i]):
@@ -568,15 +700,17 @@ def main(argv=None) -> int:
 
     items = list(iter_images(a.paths, a.recursive))
     try:
-        rc = resolve_poison(a, items[0][0] if items else None)
+        rc = resolve_words(a)
+        if rc is None:
+            rc = resolve_poison(a, items[0][0] if items else None)
     except (ValueError, OSError, json.JSONDecodeError) as e:
-        print(f'-t 参数有问题: {e}', file=sys.stderr)
+        print(f'参数有问题: {e}', file=sys.stderr)
         return 1
     if rc is not None:
         return rc
     if not items:
-        if a.poison_meta is not None:
-            return 0                              # 只是编辑预设
+        if a.poison_meta is not None or (a.words and any(w.startswith('edit') for w in a.words)):
+            return 0                              # 只是编辑预设 / 词表
         print('没有找到图片', file=sys.stderr)
         return 1
     if a.output and len(items) > 1:

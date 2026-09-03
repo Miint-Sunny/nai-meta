@@ -559,6 +559,35 @@ def make_meta(base: dict | None = None, prompt: str | None = None, uc: str | Non
     return ordered
 
 
+def compile_rules(rules: dict) -> list[tuple[str, str, "re.Pattern"]]:
+    """改词规则：默认大小写不敏感的子串匹配；old 写成 /正则/ 则按正则。"""
+    out = []
+    for old, new in rules.items():
+        if len(old) > 2 and old.startswith('/') and old.endswith('/'):
+            pat = re.compile(old[1:-1], re.I)
+        else:
+            pat = re.compile(re.escape(old), re.I)
+        out.append((old, str(new), pat))
+    return out
+
+
+def substitute_strings(obj, rules: dict, counts: Counter | None = None):
+    """递归地把 obj 里所有字符串按规则替换（dict / list 深入，其余原样）。返回 (新对象, 各规则命中次数)。"""
+    counts = Counter() if counts is None else counts
+    compiled = rules if isinstance(rules, list) else compile_rules(rules)
+    if isinstance(obj, str):
+        for old, new, pat in compiled:
+            obj, n = pat.subn(new, obj)
+            if n:
+                counts[f'{old}→{new}'] += n
+        return obj, counts
+    if isinstance(obj, dict):
+        return {k: substitute_strings(v, compiled, counts)[0] for k, v in obj.items()}, counts
+    if isinstance(obj, list):
+        return [substitute_strings(v, compiled, counts)[0] for v in obj], counts
+    return obj, counts
+
+
 def fill_meta(text: str, sets: dict | None = None) -> dict:
     """-t '内容'：每个分块都塞同一段内容。Comment 也是这段原文；--set 了 Comment 内部字段
     （seed、uc…）时 Comment 才变成 {"prompt": 内容, "uc": 内容, ...} 这样的 JSON。"""

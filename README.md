@@ -5,7 +5,7 @@
 | 短 | 子命令 | 完整 | 干什么 |
 |---|---|---|---|
 | `naii` | `nai i` | `nai-inspect` | 读出生成参数：明文层（PNG 文本块 / WebP 的 EXIF）+ LSB 隐写，两层都在时顺手比对 |
-| `nais` | `nai s` | `nai-strip` | 剥掉元数据：PNG 文本块 / eXIf / tIME / LSB 隐写；JPEG 按段无损剥 EXIF、XMP、注释；`-t` 剥完写假的（投毒） |
+| `nais` | `nai s` | `nai-strip` | 剥掉元数据：PNG 文本块 / eXIf / tIME / LSB 隐写；JPEG 按段无损剥 EXIF、XMP、注释；`-t` 剥完写假的（投毒）；`-w` 不剥只改词 |
 
 `nai` 是伞形总入口，不带参数打印用法，`nai -V` 看版本。以后的生图 agent 之类也挂在它下面
 （`src/nai_meta/cli.py` 的 `COMMANDS` 加一行即可，`gen` / `agent` 这两个名字先留着）。
@@ -174,6 +174,25 @@ edit ›
 - JPEG 和有损 WebP 没有可写隐写的 alpha，只写 EXIF。RGB 的 PNG 会补一层全 255 的 alpha 来装隐写。
 - 写完回读验证：明文层和隐写层都得读出写入的内容才算 ✔。TUI 里对应 `/t`。
 
+### 只改词：`-w`
+
+有些平台按元数据里的词封图（比如 Discord 对 `loli` 这种生图形象词）。这时候不想全剥，只想把那几个词换掉，
+其余提示词、seed、模型一个不动：
+
+```bash
+nais a.png -w discord             # 用词表 discord（内置 loli→1011）→ a_discord.png
+nais a.png -w loli=1011           # 单条规则 → a_w.png
+nais a.png -w discord -w foo=bar  # 可叠加
+nais -w edit discord              # 终端里改词表（旧=新 加，-旧 删，:w 存）；存在 ~/.config/nai-meta/words/
+nais -w list                      # 列词表
+```
+
+- 读出原图两层元数据，递归替换里面所有字符串（正向、负面、角色、Description 全覆盖），写回文本块 / EXIF 和隐写。
+- **文件名里的词也一并换**：NAI 直接下载的文件名就是提示词。
+- 匹配不分大小写、按子串（`Lolita` 也会变 `1011ta`，要精确就写正则：`/\bloli\b/=1011`）。
+- 改过内容签名作废，`signed_hash` 去掉。写完回读，旧词一个不剩才算 ✔。
+- 没有 NAI 元数据或没命中任何词的图不动。和 `-t` 互斥：`-w` 是只改词，`-t` 是全换假的。TUI 里对应 `/w`。
+
 ### 交互模式：`nais tui`
 
 ```bash
@@ -193,6 +212,7 @@ nais tui              # 或 nai s tui / nai-strip tui；nais tui ./干净 = 进�
 | `/r` | 切换文件夹递归 |
 | `/dry` `/ow` | 切换 dry-run / 覆盖同名输出 |
 | `/t <内容>` `/t 1` `/t edit 1` `/t @文件` `/t -` | 投毒：填充 / 预设 / 编辑预设 / 模板 / 关；`/t list` 列预设 |
+| `/w discord` `/w loli=1011` `/w edit discord` `/w -` | 只改词：词表 / 单条 / 改词表 / 关；`/w list` 列词表 |
 | `/help` `/q` | 说明 / 退出（Ctrl-D 也行） |
 
 Tab 补全路径，↑↓ 翻历史。退出时记住输出目录、后缀、alpha / ICC / 递归这些设置

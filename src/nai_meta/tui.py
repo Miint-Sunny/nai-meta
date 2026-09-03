@@ -21,7 +21,7 @@ from prompt_toolkit.history import FileHistory, InMemoryHistory
 from prompt_toolkit.styles import Style
 
 from .core import IMG_EXTS, SYM, config_dir, iter_images
-from .nai_strip import describe_plan, list_presets, make_opts, resolve_poison, strip_one, suffix_of
+from .nai_strip import describe_plan, list_presets, list_words, make_opts, resolve_poison, resolve_words, strip_one, suffix_of
 
 STYLE = Style.from_dict({
     'prompt': 'bold ansicyan',
@@ -41,6 +41,7 @@ HELP = """\
   /r              切换文件夹递归            /scrub     切换全通道 LSB 清零
   /dry            切换 dry-run              /ow        切换覆盖同名输出
   /t <内容>       剥完写入假元数据（投毒）  /t 1       用预设 1；/t edit 1 改预设；/t @文件 用模板；/t list 列预设；/t - 关
+  /w discord      不剥，只把命中的词换掉    /w loli=1011 单条规则；/w edit discord 改词表；/w list 列词表；/w - 关
   /help           这份说明                  /q         退出（Ctrl-D 也行）"""
 
 
@@ -107,7 +108,10 @@ def toolbar(opts) -> HTML:
         flags.append('覆盖同名')
     if opts.dry_run:
         flags.append('<warn>dry-run</warn>')
-    if opts.poison or opts.sets:
+    if opts.word_rules:
+        desc = ' '.join(opts.word_presets) if opts.word_presets else ' '.join(f'{k}→{v}' for k, v in opts.word_rules.items())
+        flags.append(f'<warn>改词 {html.escape(desc[:24])}</warn>')
+    elif opts.poison or opts.sets:
         desc = opts.poison if opts.poison_meta is None else f'预设/模板 {opts.poison}'
         flags.append(f'<warn>投毒 {html.escape(str(desc)[:24])}</warn>')
     return HTML(f' 输出: {out}   ·   ' + '   ·   '.join(flags) + '   ·   /help')
@@ -117,6 +121,15 @@ def toolbar(opts) -> HTML:
 def _toggle(opts, key: str, label: str) -> None:
     setattr(opts, key, not getattr(opts, key))
     say(f'{label}: {"开" if getattr(opts, key) else "关"}', 'dim')
+
+
+COMMANDS = {'/q', '/quit', '/exit', '/help', '/h', '/?', '/out', '/suffix', '/i', '/inplace', '/alpha', '/icc',
+            '/r', '/recursive', '/scrub', '/dry', '/ow', '/overwrite', '/t', '/w'}
+
+
+def is_command(line: str) -> bool:
+    """只认已知命令。macOS / Linux 拖进来的绝对路径也是 / 开头，不能一刀切。"""
+    return line.split(maxsplit=1)[0].lower() in COMMANDS
 
 
 def handle_command(line: str, opts) -> bool:
@@ -139,6 +152,25 @@ def handle_command(line: str, opts) -> bool:
         if arg:
             opts.suffix = arg
         say(f'后缀: {suffix_of(opts)}', 'dim')
+    elif cmd == '/w':
+        if arg in ('', '-'):
+            opts.words, opts.word_rules, opts.word_presets = [], {}, []
+            say('改词: 关', 'dim')
+        elif arg == 'list':
+            say(list_words())
+        else:
+            opts.words = list(opts.words) + [arg]
+            try:
+                rc = resolve_words(opts)
+            except Exception as e:
+                rc = 1
+                say(f'{SYM["bad"]} {e}', 'bad')
+            if rc == 1:
+                opts.words = opts.words[:-1]
+                resolve_words(opts)
+            else:
+                opts.poison, opts.poison_meta = None, None      # 和投毒互斥
+                say(f'{SYM["warn"]} 改词: ' + ' · '.join(f'{k}→{v}' for k, v in opts.word_rules.items()), 'warn')
     elif cmd == '/t':
         if arg in ('', '-'):
             opts.poison, opts.poison_meta = None, None
@@ -155,7 +187,8 @@ def handle_command(line: str, opts) -> bool:
             if rc == 1:
                 opts.poison, opts.poison_meta = None, None
             else:
-                say(f'{SYM["warn"]} 投毒: {"预设/模板 " if opts.poison_meta is not None else "提示词 "}{arg}', 'warn')
+                opts.words, opts.word_rules, opts.word_presets = [], {}, []   # 和改词互斥
+                say(f'{SYM["warn"]} 投毒: {"预设/模板 " if opts.poison_meta is not None else "内容 "}{arg}', 'warn')
     elif cmd in ('/i', '/inplace'):
         _toggle(opts, 'in_place', '原地覆盖')
         if opts.in_place:
@@ -246,7 +279,7 @@ def run_tui(argv=None) -> int:
             break
         if not line:
             continue
-        if line.startswith('/'):
+        if is_command(line):
             if not handle_command(line, opts):
                 break
             continue
