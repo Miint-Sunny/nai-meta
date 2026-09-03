@@ -40,7 +40,7 @@ HELP = """\
   /alpha          切换去 alpha 通道         /icc       切换去 ICC 色彩配置
   /r              切换文件夹递归            /scrub     切换全通道 LSB 清零
   /dry            切换 dry-run              /ow        切换覆盖同名输出
-  /t <内容>       剥完写入假元数据（投毒）  /t 1       用预设 1；/t @文件.json 用模板；/t list 列预设；/t - 关
+  /t <内容>       剥完写入假元数据（投毒）  /t 1       用预设 1；/t edit 1 改预设；/t @文件 用模板；/t list 列预设；/t - 关
   /help           这份说明                  /q         退出（Ctrl-D 也行）"""
 
 

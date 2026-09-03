@@ -57,15 +57,27 @@ def test_set_alone_keeps_original_and_overrides(tmp_path, cfg):
     assert s['signed_hash'] is None and rec['consistent'] is True
 
 
-def test_preset_edit_list_use_and_template(tmp_path, cfg, monkeypatch):
-    ed = tmp_path / 'ed.py'                                              # 假编辑器：改 prompt，seed 置空
-    ed.write_text('import json,sys\np=sys.argv[1]\nd=json.load(open(p,encoding="utf-8"))\n'
-                  'd["Comment"]["prompt"]="preset junk"\nd["Comment"]["seed"]=None\n'
-                  'json.dump(d,open(p,"w",encoding="utf-8"),ensure_ascii=False)\n')
-    monkeypatch.setenv('EDITOR', f'{sys.executable} {ed}')
-    assert strip_main(['-t', 'edit:1']) == 0                              # 不带图片：只建预设
-    preset = cfg / 'presets' / '1.json'
-    assert json.loads(preset.read_text('utf-8'))['Comment']['prompt'] == 'preset junk'
+def drive(argv, text):
+    """把要敲的东西灌进 prompt_toolkit，跑 nais。"""
+    from prompt_toolkit.application import create_app_session
+    from prompt_toolkit.input import create_pipe_input
+    from prompt_toolkit.output import DummyOutput
+    with create_pipe_input() as pipe:
+        with create_app_session(input=pipe, output=DummyOutput()):
+            pipe.send_text(text)
+            return strip_main(argv)
+
+
+def test_edit_interactive_creates_and_uses_presets(tmp_path, cfg):
+    # -t edit:1：键=值 改字段，:w 保存 → 预设 1（不带图片就只是建预设）
+    assert drive(['-t', 'edit:1'], 'prompt=preset junk\nseed=null\n:w\n') == 0
+    d = json.loads((cfg / 'presets' / '1.json').read_text('utf-8'))
+    assert d['Comment']['prompt'] == 'preset junk' and d['Comment']['seed'] is None and d['Description'] == 'preset junk'
+    # -t edit 2（空格）：:all 一键全塞
+    assert drive(['-t', 'edit', '2'], ':all 全塞\n:w\n') == 0
+    d = json.loads((cfg / 'presets' / '2.json').read_text('utf-8'))
+    assert d['Title'] == '全塞' and d['Comment'] == '全塞'
+    # 用预设 1：seed 为空 → 每张随机，尺寸按图
     src = tmp_path / 'd.png'
     nai_png(src)
     assert strip_main([str(src), '-t', '1']) == 0
@@ -73,10 +85,40 @@ def test_preset_edit_list_use_and_template(tmp_path, cfg, monkeypatch):
     s = summarize(choose_meta(rec, 'auto')[0])
     assert s['prompt'] == 'preset junk' and s['seed'] not in (None, 42) and (s['width'], s['height']) == (160, 120)
     assert rec['consistent'] is True
+    # 用预设 2：每块都是「全塞」
+    assert strip_main([str(src), '-t', '2', '-o', str(tmp_path / 'f.png')]) == 0
+    assert inspect_file(tmp_path / 'f.png')['text_chunks']['Software'] == '全塞'
     assert strip_main([str(src), '-t', '9']) == 1                         # 没有的预设
     assert strip_main(['-t', 'list']) == 0
-    assert strip_main([str(src), '-t', f'@{preset}', '-o', str(tmp_path / 'e.png')]) == 0
+    assert strip_main([str(src), '-t', f'@{cfg / "presets" / "1.json"}', '-o', str(tmp_path / 'e.png')]) == 0
     assert summarize(choose_meta(inspect_file(tmp_path / 'e.png'), 'auto')[0])['prompt'] == 'preset junk'
+
+
+def test_edit_number_select_and_name_prompt(tmp_path, cfg):
+    src = tmp_path / 'g.png'
+    nai_png(src)
+    # -t edit 不带名字：以原图为底；选 3（Software），Ctrl-U 清掉预填的值再输入；:w 后问名字
+    assert drive([str(src), '-t', 'edit'], '3\n\x15Fake Soft\n:w\nmyname\n') == 0
+    d = json.loads((cfg / 'presets' / 'myname.json').read_text('utf-8'))
+    assert d['Software'] == 'Fake Soft' and d['Comment']['seed'] == 42          # 其余沿用原图
+    rec = inspect_file(tmp_path / 'g_poison.png')
+    assert rec['text_chunks']['Software'] == 'Fake Soft'
+    # 名字和现有预设撞上就当预设用
+    assert strip_main([str(src), '-t', 'myname', '-o', str(tmp_path / 'h.png')]) == 0
+    assert inspect_file(tmp_path / 'h.png')['text_chunks']['Software'] == 'Fake Soft'
+    # :q 取消
+    assert drive([str(src), '-t', 'edit'], ':q\n') == 1
+    assert not (tmp_path / 'g_poison2.png').exists()
+
+
+def test_edit_json_external(tmp_path, cfg, monkeypatch):
+    ed = tmp_path / 'ed.py'                                              # 假编辑器：改 prompt
+    ed.write_text('import json,sys\np=sys.argv[1]\nd=json.load(open(p,encoding="utf-8"))\n'
+                  'd["Comment"]["prompt"]="from editor"\n'
+                  'json.dump(d,open(p,"w",encoding="utf-8"),ensure_ascii=False)\n')
+    monkeypatch.setenv('EDITOR', f'{sys.executable} {ed}')
+    assert drive(['-t', 'edit:3'], ':json\n:w\n') == 0
+    assert json.loads((cfg / 'presets' / '3.json').read_text('utf-8'))['Comment']['prompt'] == 'from editor'
 
 
 def test_poison_webp_and_jpeg(tmp_path, cfg):

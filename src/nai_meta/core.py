@@ -620,6 +620,14 @@ def meta_to_exif(meta: dict) -> bytes:
     return ex.tobytes()
 
 
+def load_meta_json(path: Path) -> dict:
+    """读预设 / 模板文件：顶层得是对象，_ 开头的键丢掉，Comment 字符串展开。"""
+    d = json.loads(Path(path).read_text('utf-8'))
+    if not isinstance(d, dict):
+        raise ValueError('预设得是一个 JSON 对象')
+    return expand_comment({k: v for k, v in d.items() if not k.startswith('_')})
+
+
 def config_dir() -> Path:
     if os.name == 'nt':
         base = Path(os.environ.get('APPDATA') or Path.home() / 'AppData' / 'Roaming')

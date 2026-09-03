@@ -15,9 +15,8 @@ import argparse
 import copy
 import json
 import os
-import shlex
+import re
 import struct
-import subprocess
 import sys
 from argparse import Namespace
 from collections import Counter
@@ -29,8 +28,8 @@ from PIL import Image
 from PIL.PngImagePlugin import PngInfo
 
 from .core import (GLOB_CHARS, SYM, confirm, config_dir, embed_stealth, expand_comment, fill_meta, find_stealth,
-                   fmt_size, is_nai, iter_images, make_meta, meta_to_exif, meta_to_text, parse_set, scan_png,
-                   setup_console, stealth_payload, wipe_stealth)
+                   fmt_size, is_nai, iter_images, load_meta_json, make_meta, meta_to_exif, meta_to_text, parse_set,
+                   scan_png, setup_console, stealth_payload, wipe_stealth)
 
 
 # ---------------------------------------------------------------- PNG / 通用（像素路线）
@@ -290,30 +289,18 @@ def suffix_of(opts) -> str:
     return '_poison' if (opts.poison or opts.sets) else '_clean'
 
 
-# ---------------------------------------------------------------- 投毒：预设与编辑
-EDIT_HELP = [
-    '这就是要写进图里的全部内容，保存退出即生效；清空文件或 JSON 不合法则取消。',
-    'PNG 文本块 / WebP 与 JPEG 的 EXIF：下面每个键各一块，Comment 会转成 JSON 字符串。',
-    '隐写层：Description、Software、Source、Generation time、Comment 五项打包 gzip 写进 alpha 最低位。',
-    'Comment.prompt、Description、v4_prompt.caption.base_caption 要一致（novelai.net/inspect 读 Comment.prompt）；',
-    '写入时 width / height 按每张图实际尺寸覆盖，seed 为 null 则每张随机。_ 开头的键不写入。',
-]
-
-
+# ---------------------------------------------------------------- 投毒：预设
 def preset_dir() -> Path:
     return config_dir() / 'presets'
 
 
-def load_meta_file(path: Path) -> dict:
-    d = json.loads(path.read_text('utf-8'))
-    if not isinstance(d, dict):
-        raise ValueError('预设得是一个 JSON 对象')
-    return expand_comment({k: v for k, v in d.items() if not k.startswith('_')})
+def preset_path(name: str) -> Path:
+    return preset_dir() / f'{name}.json'
 
 
 def save_preset(name: str, meta: dict) -> Path:
     preset_dir().mkdir(parents=True, exist_ok=True)
-    p = preset_dir() / f'{name}.json'
+    p = preset_path(name)
     p.write_text(json.dumps(meta, ensure_ascii=False, indent=2), 'utf-8')
     return p
 
@@ -321,43 +308,17 @@ def save_preset(name: str, meta: dict) -> Path:
 def list_presets() -> str:
     files = sorted(preset_dir().glob('*.json'), key=lambda x: (len(x.stem), x.stem))
     if not files:
-        return f'没有预设（用 nais -t edit:1 建一个，存在 {preset_dir()}）'
+        return f'没有预设（用 nais -t edit 1 建一个，存在 {preset_dir()}）'
     lines = [f'预设（{preset_dir()}）：']
     for f in files:
         try:
-            m = load_meta_file(f)
+            m = load_meta_json(f)
             c = m.get('Comment') if isinstance(m.get('Comment'), dict) else {}
-            prompt = (c.get('prompt') or m.get('Description') or '').replace('\n', ' ')
+            prompt = str(c.get('prompt') or m.get('Description') or '').replace('\n', ' ')
             lines.append(f'  {f.stem:>4}  {prompt[:70]}{"…" if len(prompt) > 70 else ""}')
         except Exception as e:
             lines.append(f'  {f.stem:>4}  <坏了: {e}>')
     return '\n'.join(lines)
-
-
-def edit_meta(meta: dict) -> dict | None:
-    """用 $VISUAL / $EDITOR 打开一份 JSON 让用户改，读回来。取消返回 None。"""
-    doc = {'_说明': EDIT_HELP, **meta}
-    config_dir().mkdir(parents=True, exist_ok=True)
-    path = config_dir() / 'edit.json'
-    path.write_text(json.dumps(doc, ensure_ascii=False, indent=2), 'utf-8')
-    editor = os.environ.get('VISUAL') or os.environ.get('EDITOR')
-    if not editor:
-        editor = 'notepad' if os.name == 'nt' else ('nano' if any(
-            os.access(os.path.join(d, 'nano'), os.X_OK) for d in os.environ.get('PATH', '').split(os.pathsep)) else 'vi')
-    print(f'用 {editor} 打开 {path}（EDITOR 环境变量可换编辑器）', file=sys.stderr)
-    try:
-        subprocess.call([*shlex.split(editor, posix=os.name != 'nt'), str(path)])
-    except OSError as e:
-        print(f'打不开编辑器 {editor}: {e}', file=sys.stderr)
-        return None
-    try:
-        text = path.read_text('utf-8')
-        if not text.strip():
-            return None
-        return load_meta_file(path)
-    except (ValueError, json.JSONDecodeError) as e:
-        print(f'JSON 不合法，已取消：{e}', file=sys.stderr)
-        return None
 
 
 def resolve_poison(opts, first: Path | None = None) -> int | None:
@@ -371,36 +332,33 @@ def resolve_poison(opts, first: Path | None = None) -> int | None:
     if spec == 'list':
         print(list_presets())
         return 0
-    if spec.startswith('edit'):
-        name = spec.partition(':')[2] or None
+    if spec == 'edit' or spec.startswith(('edit:', 'edit ')):   # edit / edit:1 / edit 1
+        from .edit import ask, edit_interactive
+        name = spec[4:].lstrip(': ').strip() or None
         base = None
-        if name and (preset_dir() / f'{name}.json').exists():
-            base = load_meta_file(preset_dir() / f'{name}.json')
+        if name and preset_path(name).exists():
+            base = load_meta_json(preset_path(name))
         elif first is not None:
             base = _orig_meta(first)
         size = Image.open(first).size if first is not None else (0, 0)
-        meta = edit_meta(make_meta(base, sets=opts.sets, size=size))
+        meta = edit_interactive(make_meta(base, sets=opts.sets, size=size), name)
         if meta is None:
             print('已取消')
             return 1
         if name is None:
-            try:
-                name = input('存为预设编号 / 名字（留空不存）: ').strip() or None
-            except (EOFError, KeyboardInterrupt):
-                name = None
+            name = ask('存为预设编号 / 名字（留空不存）: ') or None
         if name:
             print(f'预设 {name} 已存到 {save_preset(name, meta)}')
         opts.poison_meta = make_meta(meta)
         return None
     if spec.startswith('@'):
-        opts.poison_meta = make_meta(load_meta_file(Path(spec[1:]).expanduser()), sets=opts.sets)
+        opts.poison_meta = make_meta(load_meta_json(Path(spec[1:]).expanduser()), sets=opts.sets)
         return None
-    if spec.isdigit() or (preset_dir() / f'{spec}.json').exists():
-        p = preset_dir() / f'{spec}.json'
-        if not p.exists():
+    if spec.isdigit() or preset_path(spec).exists():     # 数字一律当预设；名字和现有预设撞上也当预设
+        if not preset_path(spec).exists():
             print(f'没有预设 {spec}\n{list_presets()}', file=sys.stderr)
             return 1
-        opts.poison_meta = make_meta(load_meta_file(p), sets=opts.sets)
+        opts.poison_meta = make_meta(load_meta_json(preset_path(spec)), sets=opts.sets)
     return None
 
 
@@ -590,7 +548,7 @@ def main(argv=None) -> int:
     ap.add_argument('--suffix', default=None, help='不指定 -o/-d/-i 时写在原图旁边，文件名加此后缀（默认 _clean，投毒时 _poison）')
     ap.add_argument('-t', '--poison', metavar='内容', help=(
         "剥完再写入假元数据（投毒，文本块/EXIF 与隐写两层都写）：-t '内容' 每个分块都塞这段；"
-        '-t 1 用预设 1；-t edit 打开编辑器逐字段确定，-t edit:1 编辑并存为预设 1；-t @文件.json 用现成模板；-t list 列预设'))
+        '-t 1 用预设 1；-t edit 在终端里逐字段改，-t edit 1 改并存为预设 1；-t @文件.json 用现成模板；-t list 列预设'))
     ap.add_argument('--set', action='append', default=[], metavar='键=值',
                     help='改单个字段，可重复：--set seed=7 --set uc=lowres；单独用时以原图元数据为底')
     ap.add_argument('--drop-alpha', action='store_true', help='alpha 全不透明时去掉 alpha 通道存成 RGB，文件更小')
@@ -600,8 +558,13 @@ def main(argv=None) -> int:
     ap.add_argument('--no-verify', action='store_true', help='写完不回读验证')
     ap.add_argument('-n', '--dry-run', action='store_true', help='只报告会做什么，不写文件')
     ap.add_argument('-y', '--yes', action='store_true', help='处理文件夹 / 通配符时不问 y/N（脚本里用）')
-    a = ap.parse_args(argv)
+    a = ap.parse_intermixed_args(argv)
     a.sets = a.set
+    if a.poison == 'edit' and a.paths:               # nais -t edit 1：编号被当成了路径，捞回来
+        for i in range(len(a.paths) - 1, -1, -1):
+            if not Path(a.paths[i]).exists() and re.fullmatch(r'[\w-]+', a.paths[i]):
+                a.poison = f'edit:{a.paths.pop(i)}'
+                break
 
     items = list(iter_images(a.paths, a.recursive))
     try:

@@ -140,16 +140,35 @@ $ nais ./图库
 ```bash
 nais a.png -t '杂鱼'            # 每个分块都塞这段：六个文本块 + 隐写全是「杂鱼」 → a_poison.png
 nais a.png -t 1                 # 用预设 1（整套字段，seed / 模型 / 提示词都按预设）
-nais -t edit:1                  # 编辑器里逐字段确定，存为预设 1；不带图片就只是建预设
-nais a.png -t edit              # 临时编辑一份，用完可选存为预设
+nais -t edit 1                  # 终端里逐字段改，存为预设 1；不带图片就只是建预设（edit:1 也行）
+nais a.png -t edit              # 以这张图的元数据为底临时改一份，用完可选存为预设
 nais a.png -t @模板.json         # 用现成 JSON
 nais -t list                    # 列出预设
 nais a.png -t '杂鱼' --set seed=7          # 填充之余改单个字段；动了 Comment 内部字段时 Comment 变成 JSON
 nais a.png --set seed=7 --set uc=lowres    # 只 --set：以原图元数据为底改字段，提示词原样
 ```
 
-- 预设在 `~/.config/nai-meta/presets/<编号>.json`（Windows `%APPDATA%\\nai-meta\\presets\\`），编辑器用
-  `$VISUAL` / `$EDITOR`，没设就 nano，Windows 是记事本。编辑文件开头有说明，写着每个键会进哪一块。
+`-t edit` 的界面就在终端里，先列出每一块和 Comment 里的关键字段：
+
+```
+  1  Title            NovelAI generated image
+  2  Description      1girl, solo, …
+  3  Software         NovelAI
+  4  Source           NovelAI Diffusion V5 0ADF9AB7
+  5  Generation time  6.6105579499853775
+  6  prompt           1girl, solo, …
+  7  uc               nsfw, lowres, …
+  8  seed             1699232568
+  9  steps            28
+ ...
+edit ›
+```
+
+输入编号改那一项（当前值预填好，直接改；prompt 这种多行的 Esc 再 Enter 提交），`键=值` 直接改任何字段
+（`seed=null` 表示每张随机），`:all 内容` 一键全塞同一段，`:json` 才跳到 `$EDITOR` 改完整 JSON，`:w` 保存，`:q` 取消。
+
+- 预设在 `~/.config/nai-meta/presets/<编号或名字>.json`（Windows `%APPDATA%\\nai-meta\\presets\\`）。
+  `-t 名字` 时有同名预设就用预设，没有就当填充内容。
 - 预设写入时 width / height 按每张图实际尺寸，seed 为 null 则每张随机。改过内容签名必然失效，
   `signed_hash` 一律去掉，`naii` 会显示无签名。
 - JPEG 和有损 WebP 没有可写隐写的 alpha，只写 EXIF。RGB 的 PNG 会补一层全 255 的 alpha 来装隐写。
@@ -173,7 +192,7 @@ nais tui              # 或 nai s tui / nai-strip tui；nais tui ./干净 = 进�
 | `/alpha` `/icc` `/scrub` | 切换去 alpha / 去 ICC / 全通道 LSB 清零 |
 | `/r` | 切换文件夹递归 |
 | `/dry` `/ow` | 切换 dry-run / 覆盖同名输出 |
-| `/t <内容>` `/t 1` `/t @文件` `/t -` | 投毒：填充 / 预设 / 模板 / 关；`/t list` 列预设 |
+| `/t <内容>` `/t 1` `/t edit 1` `/t @文件` `/t -` | 投毒：填充 / 预设 / 编辑预设 / 模板 / 关；`/t list` 列预设 |
 | `/help` `/q` | 说明 / 退出（Ctrl-D 也行） |
 
 Tab 补全路径，↑↓ 翻历史。退出时记住输出目录、后缀、alpha / ICC / 递归这些设置
