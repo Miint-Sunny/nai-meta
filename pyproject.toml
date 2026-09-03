@@ -1,0 +1,29 @@
+[project]
+name = "pynai"
+version = "0.1.0"
+description = "NovelAI 图片元数据小工具：读取 / 剥离 PNG 文本块与 LSB 隐写"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "pillow>=10",
+    "numpy>=1.24",
+    "prompt_toolkit>=3.0",
+    "wcwidth>=0.2",
+]
+
+[project.scripts]
+nai = "pynai.cli:main"                     # nai i / nai s
+naii = "pynai.nai_inspect:main"
+nais = "pynai.nai_strip:main"
+nai-inspect = "pynai.nai_inspect:main"
+nai-strip = "pynai.nai_strip:main"
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pynai"]
