@@ -205,6 +205,8 @@ def _describe_chunk(key: str, text: str, full: bool) -> str:
                 pass
         if key.startswith(('XML:', 'Raw profile')) or len(text) > 600:
             return f'{key}: {len(text)} 字符（-f 看全文）'
+    if '\n' not in text and len(text) <= 80:
+        return f'{key}: {text}'
     return f'{key}:\n{text}'
 
 
@@ -222,6 +224,8 @@ def render(rec: dict, prefer: str, full: bool, raw: bool) -> str:
     if meta is None:
         for k, v in tc.items():                  # 不是 NAI 也不是 A1111 的文本块：能认的报一句，其余原样给
             L.append(_describe_chunk(k, v, full))
+        if rec.get('stealth'):
+            L.append(_describe_chunk('隐写原文', rec['stealth']['raw'], full))
         if rec.get('exif'):
             L.append('EXIF:')
             for k, v in rec['exif'].items():

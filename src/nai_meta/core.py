@@ -19,10 +19,12 @@ NAI 出图时把同一份元数据写了两遍：
 """
 from __future__ import annotations
 
+import copy
 import glob
 import gzip
 import json
 import os
+import random
 import re
 import struct
 import sys
@@ -463,6 +465,167 @@ def wipe_stealth(arr: np.ndarray, channel: str, used_bits: int) -> None:
     else:
         pix = idx // 3
         arr[pix % h, pix // h, idx % 3] &= 0xFE
+
+
+# ---------------------------------------------------------------- 写入（投毒 / 自定义元数据）
+NAI_TEXT_KEYS = ('Title', 'Description', 'Software', 'Source', 'Generation time', 'Comment')   # PNG 文本块顺序
+STEALTH_KEYS = ('Description', 'Software', 'Source', 'Generation time', 'Comment')            # 隐写层不带 Title
+DEFAULT_UC = ('nsfw, lowres, artistic error, film grain, scan artifacts, worst quality, bad quality, jpeg artifacts, '
+              'very displeasing, chromatic aberration, dithering, halftone, screentone, multiple views, logo, '
+              'too many watermarks, negative space, blank page')
+
+
+def default_comment(width: int = 0, height: int = 0) -> dict:
+    """从零造一份 V5 样子的 Comment，字段和顺序照着真图抄，novelai.net/inspect 和本工具都认。"""
+    return {
+        'prompt': '', 'steps': 28, 'height': height, 'width': width, 'scale': 5.0, 'uncond_scale': 0.0,
+        'cfg_rescale': 0.0, 'seed': random.randrange(1, 2 ** 32), 'n_samples': 1, 'noise_schedule': 'karras',
+        'legacy_v3_extend': False, 'reference_information_extracted_multiple': [], 'reference_strength_multiple': [],
+        'v4_prompt': {'caption': {'base_caption': '', 'char_captions': []},
+                      'use_coords': False, 'use_order': True, 'legacy_uc': False},
+        'v4_negative_prompt': {'caption': {'base_caption': DEFAULT_UC, 'char_captions': []},
+                               'use_coords': False, 'use_order': False, 'legacy_uc': False},
+        'director_reference_strengths': None, 'director_reference_descriptions': None,
+        'upscale': None, 'straight_alpha': True, 'quality_boost': False, 'sampler': 'k_euler_ancestral',
+        'controlnet_strength': 1.0, 'controlnet_model': None, 'dynamic_thresholding': False,
+        'dynamic_thresholding_percentile': 0.999, 'dynamic_thresholding_mimic_scale': 10.0,
+        'sm': False, 'sm_dyn': False, 'skip_cfg_above_sigma': None, 'skip_cfg_below_sigma': 0.0,
+        'deliberate_euler_ancestral_bug': False, 'prefer_brownian': True, 'cfg_sched_eligibility': 'enable_for_post_summer_samplers',
+        'uncond_per_vibe': True, 'wonky_vibe_correlation': True, 'stream': 'msgpack',
+        'tag_hint_transparent_background': None, 'tag_hint_uc_preset': 2, 'tag_hint_qt': 1,
+        'legacy': False, 'color_correct': False, 'version': 1, 'uc': DEFAULT_UC,
+        'request_type': 'PromptGenerateRequest', 'model_name': 'NovelAI Diffusion V5', 'model_hash': '0ADF9AB7',
+    }
+
+
+def set_prompt(c: dict, text: str) -> None:
+    """正向提示词要同时改三处：Comment.prompt、v4_prompt.caption.base_caption（V4+ 真正用的）、外层 Description。"""
+    c['prompt'] = text
+    cap = c.setdefault('v4_prompt', {}).setdefault('caption', {})
+    cap['base_caption'] = text
+    cap.setdefault('char_captions', [])
+
+
+def set_uc(c: dict, text: str) -> None:
+    c['uc'] = text
+    cap = c.setdefault('v4_negative_prompt', {}).setdefault('caption', {})
+    cap['base_caption'] = text
+    cap.setdefault('char_captions', [])
+
+
+def parse_set(item: str) -> tuple[str, object]:
+    """--set seed=7 / --set uc=lowres / --set sm=true：值先按 JSON 解析，不行就当字符串。"""
+    k, sep, v = item.partition('=')
+    if not sep:
+        raise ValueError(f'--set 要写成 键=值：{item}')
+    try:
+        return k.strip(), json.loads(v)
+    except json.JSONDecodeError:
+        return k.strip(), v
+
+
+def make_meta(base: dict | None = None, prompt: str | None = None, uc: str | None = None,
+              sets: dict | None = None, size: tuple[int, int] = (0, 0)) -> dict:
+    """要写进图里的元数据。base = 原图的元数据（保留 seed、模型等，只换提示词，看起来更真）；
+    没有就从零造。改过内容后签名必然失效，signed_hash 一律去掉。"""
+    meta = copy.deepcopy(base) if base else {}
+    c = meta.get('Comment') if isinstance(meta.get('Comment'), dict) else None
+    if c is None:
+        c = default_comment(*size)
+    meta.setdefault('Title', 'NovelAI generated image')
+    meta.setdefault('Software', 'NovelAI')
+    meta.setdefault('Source', f"{c.get('model_name') or 'NovelAI Diffusion V5'} {c.get('model_hash') or '0ADF9AB7'}")
+    meta.setdefault('Generation time', f'{random.uniform(2, 9):.13f}')
+    if prompt is not None:
+        set_prompt(c, prompt)
+        meta['Description'] = prompt
+    if uc is not None:
+        set_uc(c, uc)
+    for k, v in (sets or {}).items():
+        if k in NAI_TEXT_KEYS:
+            meta[k] = v
+        elif k == 'prompt':
+            set_prompt(c, str(v))
+            meta['Description'] = str(v)
+        elif k == 'uc':
+            set_uc(c, str(v))
+        else:
+            c[k] = v
+    meta.setdefault('Description', c.get('prompt', ''))
+    c.pop('signed_hash', None)
+    meta['Comment'] = c
+    ordered = {k: meta[k] for k in NAI_TEXT_KEYS if k in meta}
+    ordered.update({k: v for k, v in meta.items() if k not in ordered and not k.startswith('_')})
+    return ordered
+
+
+def fill_meta(text: str, sets: dict | None = None) -> dict:
+    """-t '内容'：每个分块都塞同一段内容。Comment 也是这段原文；--set 了 Comment 内部字段
+    （seed、uc…）时 Comment 才变成 {"prompt": 内容, "uc": 内容, ...} 这样的 JSON。"""
+    meta = {k: text for k in NAI_TEXT_KEYS}
+    inner = {}
+    for k, v in (sets or {}).items():
+        if k in NAI_TEXT_KEYS:
+            meta[k] = v
+        else:
+            inner[k] = v
+    if inner:
+        meta['Comment'] = {'prompt': text, 'uc': text, **inner}
+    return meta
+
+
+def _comment_str(meta: dict) -> str:
+    c = meta.get('Comment')
+    return c if isinstance(c, str) else json.dumps(c, ensure_ascii=False)
+
+
+def meta_to_text(meta: dict) -> dict:
+    """PNG 文本块：NAI 的六块，Comment 转成 JSON 字符串。"""
+    out = {}
+    for k in NAI_TEXT_KEYS:
+        if k in meta and meta[k] is not None:
+            out[k] = _comment_str(meta) if k == 'Comment' else str(meta[k])
+    return out
+
+
+def stealth_payload(meta: dict) -> bytes:
+    """隐写比特流：magic + 32 位数据比特数 + gzip(JSON) + 32 位 FEC 长度（0xffffffff = 无），和 NAI 一致。"""
+    d = {k: (_comment_str(meta) if k == 'Comment' else meta[k]) for k in STEALTH_KEYS if k in meta}
+    data = gzip.compress(json.dumps(d, ensure_ascii=False).encode('utf-8'))
+    return b'stealth_pngcomp' + (len(data) * 8).to_bytes(4, 'big') + data + b'\xff\xff\xff\xff'
+
+
+def embed_stealth(arr: np.ndarray, payload: bytes) -> None:
+    """把比特流按列优先写进 alpha 通道最低位（arr 须是 RGBA，就地修改）。"""
+    bits = np.unpackbits(np.frombuffer(payload, dtype=np.uint8))
+    h, w = arr.shape[:2]
+    if bits.size > h * w:
+        raise ValueError(f'图太小，装不下隐写：需要 {bits.size} 像素，只有 {h * w}')
+    idx = np.arange(bits.size)
+    arr[idx % h, idx // h, 3] = (arr[idx % h, idx // h, 3] & 0xFE) | bits
+
+
+def meta_to_exif(meta: dict) -> bytes:
+    """WebP / JPEG 用的 EXIF，照 NAI 的 WebP 下载布局：Software = Source（模型名+哈希），DocumentName = Title，
+    ImageDescription = Description，UserComment = 整份 JSON。返回带 Exif\\0\\0 头的字节。"""
+    ex = Image.Exif()
+    if meta.get('Source'):
+        ex[0x0131] = str(meta['Source'])
+    if meta.get('Title'):
+        ex[0x010D] = str(meta['Title'])
+    if meta.get('Description'):
+        ex[0x010E] = str(meta['Description'])
+    full = {k: (_comment_str(meta) if k == 'Comment' else v) for k, v in meta.items() if k in NAI_TEXT_KEYS}
+    ex.get_ifd(0x8769)[0x9286] = b'ASCII\x00\x00\x00' + json.dumps(full, ensure_ascii=False).encode('utf-8')
+    return ex.tobytes()
+
+
+def config_dir() -> Path:
+    if os.name == 'nt':
+        base = Path(os.environ.get('APPDATA') or Path.home() / 'AppData' / 'Roaming')
+    else:
+        base = Path(os.environ.get('XDG_CONFIG_HOME') or Path.home() / '.config')
+    return base / 'nai-meta'
 
 
 # ---------------------------------------------------------------- 跨平台

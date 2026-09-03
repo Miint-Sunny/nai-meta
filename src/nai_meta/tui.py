@@ -20,8 +20,8 @@ from prompt_toolkit.formatted_text import HTML
 from prompt_toolkit.history import FileHistory, InMemoryHistory
 from prompt_toolkit.styles import Style
 
-from .core import IMG_EXTS, SYM, iter_images
-from .nai_strip import describe_plan, make_opts, strip_one
+from .core import IMG_EXTS, SYM, config_dir, iter_images
+from .nai_strip import describe_plan, list_presets, make_opts, resolve_poison, strip_one, suffix_of
 
 STYLE = Style.from_dict({
     'prompt': 'bold ansicyan',
@@ -40,18 +40,11 @@ HELP = """\
   /alpha          切换去 alpha 通道         /icc       切换去 ICC 色彩配置
   /r              切换文件夹递归            /scrub     切换全通道 LSB 清零
   /dry            切换 dry-run              /ow        切换覆盖同名输出
+  /t <内容>       剥完写入假元数据（投毒）  /t 1       用预设 1；/t @文件.json 用模板；/t list 列预设；/t - 关
   /help           这份说明                  /q         退出（Ctrl-D 也行）"""
 
 
 # ---------------------------------------------------------------- 设置持久化
-def config_dir() -> Path:
-    if os.name == 'nt':
-        base = Path(os.environ.get('APPDATA') or Path.home() / 'AppData' / 'Roaming')
-    else:
-        base = Path(os.environ.get('XDG_CONFIG_HOME') or Path.home() / '.config')
-    return base / 'nai-meta'
-
-
 def load_settings() -> dict:
     try:
         d = json.loads((config_dir() / 'tui.json').read_text('utf-8'))
@@ -104,7 +97,7 @@ def toolbar(opts) -> HTML:
     elif opts.outdir:
         out = f'目录 {html.escape(str(opts.outdir))}'
     else:
-        out = f'原图旁边 +{html.escape(opts.suffix)}'
+        out = f'原图旁边 +{html.escape(suffix_of(opts))}'
     flags = [f'去alpha {"开" if opts.drop_alpha else "关"}',
              f'ICC {"去" if opts.strip_icc else "留"}',
              f'递归 {"开" if opts.recursive else "关"}']
@@ -114,6 +107,9 @@ def toolbar(opts) -> HTML:
         flags.append('覆盖同名')
     if opts.dry_run:
         flags.append('<warn>dry-run</warn>')
+    if opts.poison or opts.sets:
+        desc = opts.poison if opts.poison_meta is None else f'预设/模板 {opts.poison}'
+        flags.append(f'<warn>投毒 {html.escape(str(desc)[:24])}</warn>')
     return HTML(f' 输出: {out}   ·   ' + '   ·   '.join(flags) + '   ·   /help')
 
 
@@ -134,7 +130,7 @@ def handle_command(line: str, opts) -> bool:
     elif cmd == '/out':
         if arg in ('', '-'):
             opts.outdir = None
-            say(f'输出: 写在原图旁边，后缀 {opts.suffix}', 'dim')
+            say(f'输出: 写在原图旁边，后缀 {suffix_of(opts)}', 'dim')
         else:
             p = parse_paths(arg)[0]
             opts.outdir, opts.in_place = str(p), False
@@ -142,7 +138,24 @@ def handle_command(line: str, opts) -> bool:
     elif cmd == '/suffix':
         if arg:
             opts.suffix = arg
-        say(f'后缀: {opts.suffix}', 'dim')
+        say(f'后缀: {suffix_of(opts)}', 'dim')
+    elif cmd == '/t':
+        if arg in ('', '-'):
+            opts.poison, opts.poison_meta = None, None
+            say('投毒: 关', 'dim')
+        elif arg == 'list':
+            say(list_presets())
+        else:
+            opts.poison = arg
+            try:
+                rc = resolve_poison(opts)
+            except Exception as e:
+                rc = 1
+                say(f'{SYM["bad"]} {e}', 'bad')
+            if rc == 1:
+                opts.poison, opts.poison_meta = None, None
+            else:
+                say(f'{SYM["warn"]} 投毒: {"预设/模板 " if opts.poison_meta is not None else "提示词 "}{arg}', 'warn')
     elif cmd in ('/i', '/inplace'):
         _toggle(opts, 'in_place', '原地覆盖')
         if opts.in_place:

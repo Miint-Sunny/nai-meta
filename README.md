@@ -5,7 +5,7 @@
 | 短 | 子命令 | 完整 | 干什么 |
 |---|---|---|---|
 | `naii` | `nai i` | `nai-inspect` | 读出生成参数：明文层（PNG 文本块 / WebP 的 EXIF）+ LSB 隐写，两层都在时顺手比对 |
-| `nais` | `nai s` | `nai-strip` | 剥掉元数据：PNG 文本块 / eXIf / tIME / LSB 隐写；JPEG 按段无损剥 EXIF、XMP、注释 |
+| `nais` | `nai s` | `nai-strip` | 剥掉元数据：PNG 文本块 / eXIf / tIME / LSB 隐写；JPEG 按段无损剥 EXIF、XMP、注释；`-t` 剥完写假的（投毒） |
 
 `nai` 是伞形总入口，不带参数打印用法，`nai -V` 看版本。以后的生图 agent 之类也挂在它下面
 （`src/nai_meta/cli.py` 的 `COMMANDS` 加一行即可，`gen` / `agent` 这两个名字先留着）。
@@ -132,6 +132,29 @@ $ nais ./图库
 
 每张图写完默认会**回读验证**：文本块、eXIf、EXIF、隐写都得为空才算 ✔，否则标 ✗ 并列出残留。
 
+### 投毒：`-t`
+
+剥干净之后再写一套假的进去。文本块（WebP、JPEG 是 EXIF）和隐写两层都写，novelai.net/inspect 读的是隐写层，
+只改文本块骗不过它。
+
+```bash
+nais a.png -t '杂鱼'            # 每个分块都塞这段：六个文本块 + 隐写全是「杂鱼」 → a_poison.png
+nais a.png -t 1                 # 用预设 1（整套字段，seed / 模型 / 提示词都按预设）
+nais -t edit:1                  # 编辑器里逐字段确定，存为预设 1；不带图片就只是建预设
+nais a.png -t edit              # 临时编辑一份，用完可选存为预设
+nais a.png -t @模板.json         # 用现成 JSON
+nais -t list                    # 列出预设
+nais a.png -t '杂鱼' --set seed=7          # 填充之余改单个字段；动了 Comment 内部字段时 Comment 变成 JSON
+nais a.png --set seed=7 --set uc=lowres    # 只 --set：以原图元数据为底改字段，提示词原样
+```
+
+- 预设在 `~/.config/nai-meta/presets/<编号>.json`（Windows `%APPDATA%\\nai-meta\\presets\\`），编辑器用
+  `$VISUAL` / `$EDITOR`，没设就 nano，Windows 是记事本。编辑文件开头有说明，写着每个键会进哪一块。
+- 预设写入时 width / height 按每张图实际尺寸，seed 为 null 则每张随机。改过内容签名必然失效，
+  `signed_hash` 一律去掉，`naii` 会显示无签名。
+- JPEG 和有损 WebP 没有可写隐写的 alpha，只写 EXIF。RGB 的 PNG 会补一层全 255 的 alpha 来装隐写。
+- 写完回读验证：明文层和隐写层都得读出写入的内容才算 ✔。TUI 里对应 `/t`。
+
 ### 交互模式：`nais tui`
 
 ```bash
@@ -150,6 +173,7 @@ nais tui              # 或 nai s tui / nai-strip tui；nais tui ./干净 = 进�
 | `/alpha` `/icc` `/scrub` | 切换去 alpha / 去 ICC / 全通道 LSB 清零 |
 | `/r` | 切换文件夹递归 |
 | `/dry` `/ow` | 切换 dry-run / 覆盖同名输出 |
+| `/t <内容>` `/t 1` `/t @文件` `/t -` | 投毒：填充 / 预设 / 模板 / 关；`/t list` 列预设 |
 | `/help` `/q` | 说明 / 退出（Ctrl-D 也行） |
 
 Tab 补全路径，↑↓ 翻历史。退出时记住输出目录、后缀、alpha / ICC / 递归这些设置

@@ -50,7 +50,7 @@ def test_tui_drag_file_and_folder_with_confirm(tmp_path, cfg):
     assert drive(f'/out {q(str(out))}\n{q(str(d / "a.png"))}\n{q(str(d))}\nn\n{q(str(d))}\ny\n/q\n') == 0
     assert (out / 'a.png').exists() and (out / 'b.png').exists()
     saved = json.loads((cfg / 'tui.json').read_text('utf-8'))
-    assert saved['outdir'] == str(out) and saved['suffix'] == '_clean'
+    assert saved['outdir'] == str(out) and saved['suffix'] is None      # 没改过后缀就不记，按投毒与否自动选
     # 再进来时记住了输出目录；/out - 恢复默认后写在原图旁边
     nai_png(d / 'c.png')
     assert drive(f'{q(str(d / "c.png"))}\n/out -\n{q(str(d / "c.png"))}\n/q\n') == 0
