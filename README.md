@@ -4,7 +4,7 @@
 
 | 短 | 子命令 | 完整 | 干什么 |
 |---|---|---|---|
-| `naii` | `nai i` | `nai-inspect` | 读出生成参数：PNG 文本块 → LSB 隐写 → EXIF，三路取数，两层都在时顺手比对 |
+| `naii` | `nai i` | `nai-inspect` | 读出生成参数：明文层（PNG 文本块 / WebP 的 EXIF）+ LSB 隐写，两层都在时顺手比对 |
 | `nais` | `nai s` | `nai-strip` | 剥掉元数据：PNG 文本块 / eXIf / tIME / LSB 隐写；JPEG 按段无损剥 EXIF、XMP、注释 |
 
 `nai` 是伞形总入口，不带参数打印用法，`nai -V` 看版本。以后的生图 agent 之类也挂在它下面
@@ -163,9 +163,10 @@ Windows 在 `%APPDATA%\nai-meta\`。
   文件大小会变（Pillow 的压缩等级和 NAI 的不同），pHYs 之类无关紧要的块也一并没了。
 - **JPEG**：按段过滤，丢 APP1（EXIF/XMP）、APP13（Photoshop/IPTC）、COM 等，保留 APP0（JFIF）、
   APP14（Adobe 色彩变换标记，去了会偏色）、可选 APP2（ICC）。扫描数据一个字节不动。
-- **WebP**：NAI 网站的 WebP 下载是「有损 RGB + 无损 alpha」，隐写藏在 alpha 里照样能读。
-  无损 WebP 走像素路线无损重存；有损且 alpha 全不透明的在 RIFF 容器层直接丢掉 ALPH / EXIF / XMP 块，
-  RGB 数据一字节不动；有损又带真透明的只能有损重编码，会提示。动图只去容器层元数据。
+- **WebP**：NAI 网站的 WebP 下载 = 无损 VP8L + alpha 隐写 + 8 KB EXIF（Software 存模型名，UserComment 存整个
+  Comment JSON），实测一张 832×1216 剥完 0.7 s，RGB 逐位相同，EXIF 与隐写全无。无损 WebP 走像素路线无损重存；
+  有损且 alpha 全不透明的在 RIFF 容器层直接丢掉 ALPH / EXIF / XMP 块，RGB 数据一字节不动；有损又带真透明的
+  只能有损重编码，会提示。动图只去容器层元数据。
 - **其他格式**：走 Pillow 重编码，有损，会提示。
 
 跟别的工具的区别：现有能抹 LSB 的开源工具都是把整个 alpha 通道砍掉转成 RGB。这里只清隐写占用的那些最低位，
@@ -175,8 +176,9 @@ NAI 出图 alpha 本来全 255，归回去就和生成时一模一样；带真�
 
 NAI 出图时把同一份元数据写了两遍：
 
-1. **PNG 文本块**（tEXt）：Title / Description / Software / Source / Generation time / Comment。
-   Comment 是 JSON，装着全部生成参数。exiftool 能看到，也最容易被 QQ / 微信转发剥掉。
+1. **明文层**：PNG 是文本块（tEXt）Title / Description / Software / Source / Generation time / Comment，
+   WebP 是 EXIF（Software = 模型名+哈希，ImageDescription = 提示词，UserComment = Comment JSON）。
+   Comment 装着全部生成参数。exiftool 能看到，也最容易被 QQ / 微信转发剥掉。
 2. **LSB 隐写**（stealth pnginfo）：把 Description、Software、Source、Generation time、Comment 这份
    JSON gzip 后，按列优先写进 alpha 通道每个像素的最低位。novelai.net/inspect 读的就是它。
    布局 `[magic 15 字节][32 位大端长度][数据][32 位 FEC 长度][FEC]`，magic 是 `stealth_pngcomp`，
@@ -217,7 +219,7 @@ tests/test_tui.py        拖拽路径解析、文件夹 y/N、设置持久化、
 
 本机 900 多张真图跑过：NovelAI V4 / V4.5 / V5 全部 14 个模型哈希、文生图 / i2i / inpaint / Enhance / 导演工具、
 vibe transfer、角色参考、被转发剥掉文本块只剩隐写的图、A1111 / ComfyUI / 相机 JPEG，零崩溃；剥离后 PNG 像素逐位相同、
-JPEG 扫描数据逐字节相同。NAI 网站的 WebP 下载没有真样本，只用 Pillow 合成图验证过。Windows 没有真机测试。
+JPEG 扫描数据逐字节相同。NAI 网站的 WebP 下载用一张真样本验证过读取、比对与剥离。Windows 没有真机测试。
 
 ## 许可
 

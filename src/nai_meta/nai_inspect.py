@@ -53,6 +53,33 @@ def read_exif(im: Image.Image) -> dict | None:
     return out
 
 
+def exif_meta(ex: dict | None) -> dict | None:
+    """NAI 的 WebP 把元数据写在 EXIF 里：Software = 模型名+哈希（相当于 Source）、DocumentName = Title、
+    ImageDescription = 提示词、UserComment = {"Comment": "..."}。整理成和 PNG 文本块同构的 dict，
+    好让比对和摘要复用。别的工具塞在 UserComment 里的 A1111 参数也认。"""
+    if not ex:
+        return None
+    m = None
+    for key in ('UserComment', 'ImageDescription'):
+        v = ex.get(key)
+        m = meta_from_text(v) if isinstance(v, str) else None
+        if m:
+            break
+    if not m:
+        return None
+    sw = str(ex.get('Software') or '')
+    if 'NovelAI' in sw:
+        m.setdefault('Source', sw)
+        m.setdefault('Software', 'NovelAI')
+    elif sw:
+        m.setdefault('Software', sw)
+    if isinstance(ex.get('ImageDescription'), str) and 'Description' not in m:
+        m['Description'] = ex['ImageDescription']
+    if isinstance(ex.get('DocumentName'), str):
+        m.setdefault('Title', ex['DocumentName'])
+    return m
+
+
 def inspect_file(path: Path) -> dict:
     rec: dict = {'file': str(path)}
     try:
@@ -86,43 +113,44 @@ def inspect_file(path: Path) -> dict:
         rec['stealth'] = {'channel': st.channel, 'compressed': st.compressed, 'magic': st.magic,
                           'bytes': st.nbytes, 'fec_bytes': st.fec_bytes, 'raw': st.text, 'meta': st.meta}
 
-    # 3. EXIF（PNG eXIf 块 / JPEG APP1）
+    # 3. EXIF（PNG eXIf 块 / JPEG APP1 / WebP EXIF 块）。NAI 的 WebP 下载把参数写在这里
     rec['exif'] = read_exif(im)
+    rec['exif_meta'] = exif_meta(rec['exif'])
     rec['xmp'] = len(im.info['xmp']) if im.info.get('xmp') else None
 
-    # 两层都是 NAI 数据时比对
+    # 明文层（文本块，没有就是 EXIF）和隐写层都是 NAI 数据时比对
+    outer, outer_name = (text_meta, '文本块') if text_meta else (rec['exif_meta'], 'EXIF')
+    rec['outer_layer'] = outer_name if outer else None
     sm = rec['stealth']['meta'] if rec['stealth'] else None
     rec['consistent'] = None
-    if is_nai(text_meta) and is_nai(sm):
-        d = diff_meta(text_meta, sm)
+    if is_nai(outer) and is_nai(sm):
+        d = diff_meta(outer, sm)
         rec['consistent'] = not d
         rec['diff_keys'] = d
     return rec
 
 
 def choose_meta(rec: dict, prefer: str) -> tuple[dict | None, str | None]:
-    """按 --text/--stealth 或自动顺序挑一份来做摘要。返回 (meta, 来源名)。"""
-    text_meta = rec.get('text_meta')
+    """按 --text/--stealth 或自动顺序挑一份来做摘要。返回 (meta, 来源名)。
+    自动顺序：明文层（PNG 文本块 / WebP 的 EXIF）→ 隐写 → A1111 参数 → JPEG 注释。"""
+    text_meta, ex_meta = rec.get('text_meta'), rec.get('exif_meta')
     st_meta = rec['stealth']['meta'] if rec.get('stealth') else None
+    outer, outer_name = (text_meta, '文本块') if is_nai(text_meta) else (ex_meta, 'EXIF')
     if prefer == 'text':
-        return (text_meta, '文本块') if is_nai(text_meta) else (None, None)
+        return (outer, outer_name) if is_nai(outer) else (None, None)
     if prefer == 'stealth':
         return (st_meta, '隐写') if is_nai(st_meta) else (None, None)
-    if is_nai(text_meta):
-        return text_meta, '文本块'
+    if is_nai(outer):
+        return outer, outer_name
     if is_nai(st_meta):
         return st_meta, '隐写'
     a1111 = parse_a1111((rec.get('text_chunks') or {}).get('parameters', ''))
     if a1111:
         return a1111, '文本块 parameters'
-    # EXIF UserComment / ImageDescription / JPEG 注释里的 JSON 或 A1111 参数
-    for src, s in (('EXIF', (rec.get('exif') or {}).get('UserComment')),
-                   ('EXIF', (rec.get('exif') or {}).get('ImageDescription')),
-                   ('注释', rec.get('comment'))):
-        m = meta_from_text(s) if isinstance(s, str) else None
-        if m:
-            return m, src
-    return None, None
+    if ex_meta:                                  # EXIF 里的 A1111 参数之类
+        return ex_meta, 'EXIF'
+    m = meta_from_text(rec['comment']) if isinstance(rec.get('comment'), str) else None
+    return (m, '注释') if m else (None, None)
 
 
 # ---------------------------------------------------------------- 输出
@@ -154,13 +182,13 @@ def _meta_line(rec: dict, src: str | None) -> str:
     else:
         parts.append(f"隐写 {SYM['no']}")
     if rec.get('exif'):
-        parts.append(f"EXIF {SYM['yes']} {len(rec['exif'])} 项")
+        parts.append(f"EXIF {SYM['yes']} {len(rec['exif'])} 项" + ('，含 NAI 参数' if is_nai(rec.get('exif_meta')) else ''))
     if rec.get('xmp'):
         parts.append(f"XMP {SYM['yes']} {rec['xmp']} B")
     if rec.get('consistent') is True:
         parts.append('两层一致')
     elif rec.get('consistent') is False:
-        parts.append(f"{SYM['warn']} 文本块与隐写不一致: " + ', '.join(rec['diff_keys']))
+        parts.append(f"{SYM['warn']} {rec.get('outer_layer') or '明文层'}与隐写不一致: " + ', '.join(rec['diff_keys']))
     if src:
         parts.append(f'读自{src}')
     return _lab('元数据') + ' · '.join(parts)
@@ -290,7 +318,7 @@ def main(argv=None) -> int:
     ap.add_argument('paths', nargs='+', help='图片文件或目录')
     ap.add_argument('-r', '--recursive', action='store_true', help='目录递归')
     g = ap.add_mutually_exclusive_group()
-    g.add_argument('--text', action='store_true', help='只用文本块（不看隐写）')
+    g.add_argument('--text', action='store_true', help='只用明文层：PNG 文本块 / WebP 的 EXIF（不看隐写）')
     g.add_argument('--stealth', action='store_true', help='只用隐写（不看文本块）')
     ap.add_argument('-f', '--full', action='store_true', help='把 Comment 里的全部参数也打出来')
     ap.add_argument('--raw', action='store_true', help='附带原始文本块 / 隐写 JSON 字符串')
