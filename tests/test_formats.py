@@ -92,7 +92,7 @@ def test_fec_data_detected_and_wiped(tmp_path):
     arr = random_rgba()
     fec = b'\xab' * 40
     n = _official_layout(arr, gzip.compress(json.dumps(META).encode()), fec)
-    arr[-10:, -10:, 3] = 0                    # 加点真透明，逼 strip 走「只擦占用位」而不是 alpha→255
+    arr[-10:, -10:, 3] = 0                    # 加点真透明：不是全不透明也得把占用区擦干净
     src = tmp_path / 'a.png'
     Image.fromarray(arr).save(src)
     with Image.open(src) as im:
@@ -103,8 +103,27 @@ def test_fec_data_detected_and_wiped(tmp_path):
     assert_clean(dst)
     out = np.asarray(Image.open(dst))
     col_major = out[..., 3].T.reshape(-1)
-    assert (col_major[:n] == 0xFE).all()      # 头 + 载荷 + FEC 段全清零
-    assert (out[-10:, -10:, 3] == 0).all()
+    assert (col_major[:n] == 0xFF).all()      # 头 + 载荷 + FEC 段：254/255 一律归回 255
+    assert (out[-10:, -10:, 3] == 0).all()    # 真透明不动
+
+
+def test_stealth_area_back_to_255_despite_odd_edge_pixels(tmp_path):
+    """真实 NAI WebP：底边有几个 alpha 239 / 251 的像素，整张不算全不透明。
+    以前因此只清最低位，留下一条 254 的带子（等于告诉别人这里擦过隐写）；现在占用区归回 255，别处一位不碰。"""
+    arr = random_rgba()
+    arr[..., 3] = 255
+    embed(arr, 'alpha', 'stealth_pngcomp', gzip.compress(json.dumps(META).encode()))
+    h, w = arr.shape[:2]
+    arr[h - 1, w - 1, 3], arr[h - 2, w // 2, 3], arr[1, 0, 3] = 239, 251, 239   # 最后一个落在占用区里
+    src = tmp_path / 'a.webp'
+    Image.fromarray(arr).save(src, lossless=True)
+    assert strip_main([str(src)]) == 0
+    out = np.asarray(Image.open(tmp_path / 'a_clean.webp').convert('RGBA'))
+    assert np.array_equal(out[..., :3], arr[..., :3])
+    a = out[..., 3].copy()
+    assert a[h - 1, w - 1] == 239 and a[h - 2, w // 2] == 251 and a[1, 0] == 238   # 占用区里的只清最低位
+    a[h - 1, w - 1] = a[h - 2, w // 2] = a[1, 0] = 255
+    assert (a == 255).all()                   # 其余全是 255，没有 254 的带子
 
 
 def _nai_style_exif():
@@ -135,3 +154,20 @@ def test_nai_webp_download_layout(tmp_path):
     assert_clean(dst)
     out = np.asarray(Image.open(dst).convert('RGBA'))
     assert np.array_equal(out[..., :3], arr[..., :3]) and (out[..., 3] == 255).all()
+
+
+def test_nai_webp_description_leading_nuls(tmp_path):
+    """真实 NAI WebP：提示词带中文时 Description 前面多 4 个 NUL（ImageDescription 和 UserComment 的整份 JSON 里都有），
+    不能算两层不一致，也不能带进 -p 输出。"""
+    from nai_meta.nai_inspect import inspect_file
+    src = tmp_path / 'nai.webp'
+    nul = '\x00\x00\x00\x00' + META['Description']
+    ex = Image.Exif()
+    ex[0x0131] = META['Source']
+    ex[0x010d] = 'NovelAI generated image'
+    ex[0x010e] = nul
+    ex.get_ifd(0x8769)[0x9286] = b'ASCII\x00\x00\x00' + json.dumps({**META, 'Description': nul}).encode()
+    Image.fromarray(_stealth_rgba()).save(src, lossless=True, exif=ex.tobytes())
+    assert b'\x00\x00\x00\x00' + META['Description'].encode() in src.read_bytes()   # 确实写进去了
+    rec = inspect_file(src)
+    assert rec['exif_meta']['Description'] == META['Description'] and rec['consistent'] is True

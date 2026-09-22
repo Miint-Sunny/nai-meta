@@ -2,8 +2,8 @@
 """nai-strip：剥掉 NovelAI 图片的元数据，像素不动。
 
 PNG：去掉全部文本块（tEXt/iTXt/zTXt）、eXIf、tIME，擦掉 LSB 隐写，然后重新编码
-     （PNG 无损，重编码不掉画质）。alpha 通道如果本来就是全不透明（NAI 出图都是），
-     顺手把被隐写改成 254 的像素归回 255。
+     （PNG 无损，重编码不掉画质）。隐写占用区里被改成 254 的 alpha 归回 255，
+     别处的 alpha 一位不碰（NAI 的 WebP 边缘常有几个不到 254 的像素，照样保留）。
 JPEG：按段剥掉 APP1(EXIF/XMP)、APP13(Photoshop/IPTC)、COM 等，不重新编码，画质不变。
 WebP：无损的走像素路线无损重存；有损且 alpha 全不透明的（NAI 的 WebP 下载）在容器层丢掉
      ALPH / EXIF / XMP 块，RGB 数据一字节不动；有损又带真透明的只能有损重编码，会提示。
@@ -46,16 +46,23 @@ def clean_pixels(im: Image.Image, opts) -> tuple[Image.Image, list[str], list[st
 
     arr = np.array(im)                           # 拷贝，可写
     st = find_stealth(im)
+    restored = 0
     if st:
-        wipe_stealth(arr, st.channel, st.used_bits)
+        restored = wipe_stealth(arr, st.channel, st.used_bits)
         done.append(f'隐写 {st.describe()}')
     if opts.scrub_all:
-        arr &= 0xFE
+        arr[:, :, :3] &= 0xFE
+        if im.mode == 'RGBA':                    # alpha 同隐写区的规矩：≥254 归 255，其余清最低位
+            a = arr[:, :, 3]
+            restored += int(np.count_nonzero(a == 254))
+            arr[:, :, 3] = np.where(a >= 254, 255, a & 0xFE)
         done.append('全通道 LSB 清零')
     if im.mode == 'RGBA':
         a = arr[:, :, 3]
-        if a.min() >= 254 and (a != 255).any():  # 本来全不透明，只被隐写动过最低位
+        if a.min() >= 254 and (a != 255).any():  # 本来全不透明，被没认出来的东西动过最低位
+            restored += int(np.count_nonzero(a == 254))
             a[:] = 255
+        if restored:
             done.append('alpha→255')
         if opts.drop_alpha:
             if (a == 255).all():

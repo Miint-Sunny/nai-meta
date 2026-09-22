@@ -30,7 +30,9 @@ def _exif_value(v):
             return v.decode('utf-8').strip('\x00')
         except UnicodeDecodeError:
             return f'<{len(v)} bytes>'
-    if isinstance(v, (int, float, str)):
+    if isinstance(v, str):                       # 前后的 NUL 没意义（见 exif_meta）
+        return v.strip('\x00')
+    if isinstance(v, (int, float)):
         return v
     return str(v)
 
@@ -77,7 +79,9 @@ def exif_meta(ex: dict | None) -> dict | None:
         m['Description'] = ex['ImageDescription']
     if isinstance(ex.get('DocumentName'), str):
         m.setdefault('Title', ex['DocumentName'])
-    return m
+    # NAI 的 WebP：提示词带中文时 Description 前面会多 4 个 NUL（ImageDescription 和 UserComment 的 JSON 里都有，
+    # 隐写层里没有）。NUL 在提示词里没有意义，留着会误报两层不一致、还会跟着 -p 进剪贴板
+    return {k: v.strip('\x00') if isinstance(v, str) else v for k, v in m.items()}
 
 
 def inspect_file(path: Path) -> dict:

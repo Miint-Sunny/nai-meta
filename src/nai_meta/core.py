@@ -456,15 +456,20 @@ def _decode_channel(arr: np.ndarray, channel: str) -> Stealth | None:
     return Stealth(channel, compressed, magic, used, len(payload), payload.decode('utf-8', 'replace'), fec_bytes)
 
 
-def wipe_stealth(arr: np.ndarray, channel: str, used_bits: int) -> None:
-    """就地把隐写占用的那些最低位清零。只动头 + 数据覆盖到的像素，其余一位不碰。"""
+def wipe_stealth(arr: np.ndarray, channel: str, used_bits: int) -> int:
+    """就地擦掉隐写占用的那些最低位。只动头 + 数据覆盖到的像素，其余一位不碰。
+    alpha 隐写：占用区里 ≥254 的归回 255（NAI 是在不透明的 alpha 上改最低位，254 只可能是它写的），
+    其余清最低位。整张图有几个非 255 的边缘像素（NAI 的 WebP 常见）也不影响。返回归回 255 的像素数。"""
     h = arr.shape[0]
     idx = np.arange(used_bits)
     if channel == 'alpha':
-        arr[idx % h, idx // h, 3] &= 0xFE
-    else:
-        pix = idx // 3
-        arr[pix % h, pix // h, idx % 3] &= 0xFE
+        rows, cols = idx % h, idx // h
+        a = arr[rows, cols, 3]
+        arr[rows, cols, 3] = np.where(a >= 254, 255, a & 0xFE)
+        return int(np.count_nonzero(a == 254))
+    pix = idx // 3
+    arr[pix % h, pix // h, idx % 3] &= 0xFE
+    return 0
 
 
 # ---------------------------------------------------------------- 写入（投毒 / 自定义元数据）
