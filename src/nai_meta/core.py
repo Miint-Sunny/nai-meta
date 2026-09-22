@@ -529,6 +529,12 @@ def make_meta(base: dict | None = None, prompt: str | None = None, uc: str | Non
     """要写进图里的元数据。base = 原图的元数据（保留 seed、模型等，只换提示词，看起来更真）；
     没有就从零造。改过内容后签名必然失效，signed_hash 一律去掉。"""
     meta = copy.deepcopy(base) if base else {}
+    if isinstance(meta.get('Comment'), str):     # 「每块塞同一段」那种：Comment 是原文不是 JSON，照原样留
+        filled = fill_meta(meta['Comment'], sets)
+        for k in NAI_TEXT_KEYS:
+            if k != 'Comment' and k in meta and k not in (sets or {}):
+                filled[k] = meta[k]
+        return filled
     c = meta.get('Comment') if isinstance(meta.get('Comment'), dict) else None
     if c is None:
         c = default_comment(*size)

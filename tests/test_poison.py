@@ -11,7 +11,7 @@ from test_roundtrip import nai_png, random_rgba
 from nai_meta.core import NAI_TEXT_KEYS, STEALTH_KEYS, summarize
 from nai_meta.nai_inspect import choose_meta, inspect_file
 from nai_meta.nai_strip import main as strip_main
-from nai_meta.nai_strip import webp_chunks
+from nai_meta.nai_strip import BUILTIN_PRESETS, list_presets, webp_chunks
 
 
 @pytest.fixture
@@ -69,28 +69,30 @@ def drive(argv, text):
 
 
 def test_edit_interactive_creates_and_uses_presets(tmp_path, cfg):
-    # -t edit:1：键=值 改字段，:w 保存 → 预设 1（不带图片就只是建预设）
-    assert drive(['-t', 'edit:1'], 'prompt=preset junk\nseed=null\n:w\n') == 0
-    d = json.loads((cfg / 'presets' / '1.json').read_text('utf-8'))
+    # -t edit:3：键=值 改字段，:w 保存 → 预设 3（不带图片就只是建预设）
+    assert drive(['-t', 'edit:3'], 'prompt=preset junk\nseed=null\n:w\n') == 0
+    d = json.loads((cfg / 'presets' / '3.json').read_text('utf-8'))
     assert d['Comment']['prompt'] == 'preset junk' and d['Comment']['seed'] is None and d['Description'] == 'preset junk'
-    # -t edit 2（空格）：:all 一键全塞
-    assert drive(['-t', 'edit', '2'], ':all 全塞\n:w\n') == 0
-    d = json.loads((cfg / 'presets' / '2.json').read_text('utf-8'))
+    # -t edit 4（空格）：:all 一键全塞
+    assert drive(['-t', 'edit', '4'], ':all 全塞\n:w\n') == 0
+    d = json.loads((cfg / 'presets' / '4.json').read_text('utf-8'))
     assert d['Title'] == '全塞' and d['Comment'] == '全塞'
-    # 用预设 1：seed 为空 → 每张随机，尺寸按图
+    # 用预设 3：seed 为空 → 每张随机，尺寸按图
     src = tmp_path / 'd.png'
     nai_png(src)
-    assert strip_main([str(src), '-t', '1']) == 0
+    assert strip_main([str(src), '-t', '3']) == 0
     rec = inspect_file(tmp_path / 'd_poison.png')
     s = summarize(choose_meta(rec, 'auto')[0])
     assert s['prompt'] == 'preset junk' and s['seed'] not in (None, 42) and (s['width'], s['height']) == (160, 120)
     assert rec['consistent'] is True
-    # 用预设 2：每块都是「全塞」
-    assert strip_main([str(src), '-t', '2', '-o', str(tmp_path / 'f.png')]) == 0
-    assert inspect_file(tmp_path / 'f.png')['text_chunks']['Software'] == '全塞'
+    # 用预设 4：每块都是「全塞」，Comment 也是（以前被换成了默认 JSON）
+    assert strip_main([str(src), '-t', '4', '-o', str(tmp_path / 'f.png')]) == 0
+    rec = inspect_file(tmp_path / 'f.png')
+    assert rec['text_chunks'] == {k: '全塞' for k in NAI_TEXT_KEYS}
+    assert {k: rec['stealth']['meta'][k] for k in STEALTH_KEYS} == {k: '全塞' for k in STEALTH_KEYS}
     assert strip_main([str(src), '-t', '9']) == 1                         # 没有的预设
     assert strip_main(['-t', 'list']) == 0
-    assert strip_main([str(src), '-t', f'@{cfg / "presets" / "1.json"}', '-o', str(tmp_path / 'e.png')]) == 0
+    assert strip_main([str(src), '-t', f'@{cfg / "presets" / "3.json"}', '-o', str(tmp_path / 'e.png')]) == 0
     assert summarize(choose_meta(inspect_file(tmp_path / 'e.png'), 'auto')[0])['prompt'] == 'preset junk'
 
 
@@ -143,3 +145,48 @@ def test_poison_webp_and_jpeg(tmp_path, cfg):
     assert rec['exif_meta']['Description'] == 'z' and rec['stealth'] is None
     assert [t for t, _ in webp_chunks(out.read_bytes())] == [b'VP8X', b'VP8 ', b'EXIF']
     assert dict(webp_chunks(out.read_bytes()))[b'VP8 '] == dict(webp_chunks(lw.read_bytes()))[b'VP8 ']
+
+
+BLANK, ZAKO = ' ' * 512, ', '.join(['杂鱼~♥'] * 64)
+
+
+@pytest.mark.parametrize('num, text', [('1', BLANK), ('2', ZAKO)])
+def test_builtin_presets_fill_every_chunk(tmp_path, cfg, num, text):
+    """内置预设 1 = 空格，2 = 杂鱼~♥ ×64：两层每一块（含 Comment）都是这段原文。"""
+    assert BUILTIN_PRESETS[num][1] == text
+    src = tmp_path / 'a.png'
+    nai_png(src)
+    assert strip_main([str(src), '-t', num]) == 0
+    rec = inspect_file(tmp_path / 'a_poison.png')
+    assert rec['text_chunks'] == {k: text for k in NAI_TEXT_KEYS}
+    assert {k: rec['stealth']['meta'][k] for k in STEALTH_KEYS} == {k: text for k in STEALTH_KEYS}
+    assert 'ABCD1234' not in (tmp_path / 'a_poison.png').read_bytes().decode('latin-1')
+    j = tmp_path / 'b.jpg'                                               # JPEG：EXIF 里也是这段
+    Image.fromarray(random_rgba()[:, :, :3]).save(j, quality=90)
+    assert strip_main([str(j), '-t', num]) == 0
+    assert inspect_file(tmp_path / 'b_poison.jpg')['exif_meta']['Description'] == text
+
+
+def test_builtin_preset_zako_shape_and_set(tmp_path, cfg):
+    assert ZAKO.count('杂鱼~♥') == 64 and ZAKO.startswith('杂鱼~♥, 杂鱼~♥') and ZAKO.endswith('♥')
+    src = tmp_path / 'a.png'
+    nai_png(src)
+    # --set 了 Comment 内部字段：Comment 变 JSON，prompt / uc 仍是那段
+    assert strip_main([str(src), '-t', '2', '--set', 'seed=7']) == 0
+    s = summarize(choose_meta(inspect_file(tmp_path / 'a_poison.png'), 'auto')[0])
+    assert s['prompt'] == ZAKO and s['uc'] == ZAKO and s['seed'] == 7
+
+
+def test_own_preset_overrides_builtin(tmp_path, cfg):
+    text = list_presets()
+    assert '内置 · 空格' in text and '内置 · 杂鱼' in text
+    # -t edit 2：底子就是内置的杂鱼，改一块存下来 → 盖过内置
+    assert drive(['-t', 'edit', '2'], 'Title=mine\n:w\n') == 0
+    d = json.loads((cfg / 'presets' / '2.json').read_text('utf-8'))
+    assert d['Title'] == 'mine' and d['Comment'] == ZAKO
+    assert '盖过内置 杂鱼' in list_presets()
+    src = tmp_path / 'a.png'
+    nai_png(src)
+    assert strip_main([str(src), '-t', '2']) == 0
+    chunks = inspect_file(tmp_path / 'a_poison.png')['text_chunks']
+    assert chunks['Title'] == 'mine' and chunks['Software'] == ZAKO and chunks['Comment'] == ZAKO

@@ -21,7 +21,8 @@ from prompt_toolkit.history import FileHistory, InMemoryHistory
 from prompt_toolkit.styles import Style
 
 from .core import IMG_EXTS, SYM, config_dir, iter_images
-from .nai_strip import describe_plan, list_presets, list_words, make_opts, resolve_poison, resolve_words, strip_one, suffix_of
+from .nai_strip import (describe_plan, list_presets, list_words, make_opts, name_hint, resolve_poison, resolve_words,
+                        strip_one, suffix_of, today)
 
 STYLE = Style.from_dict({
     'prompt': 'bold ansicyan',
@@ -31,16 +32,18 @@ STYLE = Style.from_dict({
     'warn': 'bold ansiyellow',
 })
 # 退出时记住的设置。原地覆盖、dry-run 故意不记：每次进来都该从安全状态开始
-SAVED_KEYS = ('outdir', 'suffix', 'drop_alpha', 'strip_icc', 'scrub_all', 'recursive', 'overwrite')
+SAVED_KEYS = ('outdir', 'suffix', 'drop_alpha', 'strip_icc', 'scrub_all', 'recursive', 'overwrite', 'rename')
 
 HELP = """\
 拖图片 / 文件夹进来，回车即处理（文件夹会先问 y/N）。命令：
   /out <目录>     输出到指定目录            /out -     恢复写在原图旁边
   /suffix <后缀>  旁边模式的文件名后缀      /i         切换原地覆盖（不留备份）
+  /n              切换改名成 日期-编号（20260923-0001…，同目录接着往后排；和 /i 一起就是原地改名）
   /alpha          切换去 alpha 通道         /icc       切换去 ICC 色彩配置
   /r              切换文件夹递归            /scrub     切换全通道 LSB 清零
   /dry            切换 dry-run              /ow        切换覆盖同名输出
-  /t <内容>       剥完写入假元数据（投毒）  /t 1       用预设 1；/t edit 1 改预设；/t @文件 用模板；/t list 列预设；/t - 关
+  /t <内容>       剥完写入假元数据（投毒）  /t 1 内置「空格」；/t 2 内置「杂鱼~♥」×64；/t 3 起自己的预设
+                  /t edit 3 改预设；/t @文件 用模板；/t list 列预设；/t - 关（不投毒 = 全部擦掉）
   /w discord      不剥，只把命中的词换掉    /w loli=1011 单条规则；/w edit discord 改词表；/w list 列词表；/w - 关
   /help           这份说明                  /q         退出（Ctrl-D 也行）"""
 
@@ -93,12 +96,13 @@ def show_result(line: str) -> None:
 
 
 def toolbar(opts) -> HTML:
+    named = f'改名 {today()}-NNNN' if opts.rename else ''
     if opts.in_place:
-        out = '<warn>原地覆盖</warn>'
+        out = '<warn>原地覆盖</warn>' + (f' {named}' if named else '')
     elif opts.outdir:
-        out = f'目录 {html.escape(str(opts.outdir))}'
+        out = f'目录 {html.escape(str(opts.outdir))}' + (f' {named}' if named else '')
     else:
-        out = f'原图旁边 +{html.escape(suffix_of(opts))}'
+        out = f'原图旁边 {named or "+" + html.escape(suffix_of(opts))}'
     flags = [f'去alpha {"开" if opts.drop_alpha else "关"}',
              f'ICC {"去" if opts.strip_icc else "留"}',
              f'递归 {"开" if opts.recursive else "关"}']
@@ -124,7 +128,7 @@ def _toggle(opts, key: str, label: str) -> None:
 
 
 COMMANDS = {'/q', '/quit', '/exit', '/help', '/h', '/?', '/out', '/suffix', '/i', '/inplace', '/alpha', '/icc',
-            '/r', '/recursive', '/scrub', '/dry', '/ow', '/overwrite', '/t', '/w'}
+            '/r', '/recursive', '/scrub', '/dry', '/ow', '/overwrite', '/t', '/w', '/n', '/rename'}
 
 
 def is_command(line: str) -> bool:
@@ -194,6 +198,8 @@ def handle_command(line: str, opts) -> bool:
         if opts.in_place:
             opts.outdir = None
             say(f'{SYM["warn"]} 原地覆盖不留备份，确定再拖', 'warn')
+    elif cmd in ('/n', '/rename'):
+        _toggle(opts, 'rename', f'改名成 {today()}-编号')
     elif cmd == '/alpha':
         _toggle(opts, 'drop_alpha', '去 alpha')
     elif cmd == '/icc':
@@ -234,6 +240,7 @@ def process(paths: list[Path], opts, confirm) -> None:
             say(f'找不到: {p}', 'bad')
     if not items:
         return
+    vars(opts).pop('_numbers', None)             # 每批重新看一眼目录里已有的编号
     ok = fail = 0
     for src, rel in items:
         try:
@@ -246,6 +253,10 @@ def process(paths: list[Path], opts, confirm) -> None:
         fail += not good
     if len(items) > 1:
         say(f'—— 共 {len(items)} 张：成功 {ok}，失败/跳过 {fail}', 'dim')
+    hint = '' if vars(opts).get('_hinted') else name_hint(items, opts)
+    if hint:                                     # 一次会话只提醒一回
+        say(hint.replace('加 -N', '/n 打开'), 'warn')
+        opts._hinted = True
 
 
 def run_tui(argv=None) -> int:

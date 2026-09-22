@@ -18,6 +18,7 @@ import os
 import re
 import struct
 import sys
+import time
 from argparse import Namespace
 from collections import Counter
 from pathlib import Path
@@ -251,7 +252,7 @@ def plan_webp(src: Path, im: Image.Image, opts, poison: dict | None = None, labe
 DEFAULTS = dict(paths=[], recursive=False, output=None, outdir=None, in_place=False, suffix=None,
                 drop_alpha=False, scrub_all=False, strip_icc=False, overwrite=False, no_verify=False,
                 dry_run=False, yes=False, poison=None, sets={}, poison_meta=None,
-                words=[], word_rules={}, word_presets=[])
+                words=[], word_rules={}, word_presets=[], rename=False)
 
 
 def make_opts(**overrides) -> Namespace:
@@ -263,22 +264,49 @@ def describe_plan(items, opts, label: str = '') -> str:
     """确认提示用的一句话：多少张、什么格式、写到哪。"""
     ext = Counter(f.suffix.lower().lstrip('.') for f, _ in items)
     kinds = ' · '.join(f'{k} {n}' for k, n in ext.most_common())
+    named = f'改名 {today()}-NNNN' if opts.rename else ''
     if opts.in_place:
-        dest = f'{SYM["warn"]} 原地覆盖，不留备份'
+        dest = f'{SYM["warn"]} 原地覆盖，不留备份' + (f'，{named}' if named else '')
     elif opts.output:
         dest = f'→ {opts.output}'
     elif opts.outdir:
-        dest = f'→ 目录 {opts.outdir}'
+        dest = f'→ 目录 {opts.outdir}' + (f'，{named}' if named else '')
     else:
-        dest = f'→ 原图旁边 +{suffix_of(opts)}'
+        dest = f'→ 原图旁边 {named or "+" + suffix_of(opts)}'
     return f'{label + "：" if label else ""}{len(items)} 张（{kinds}）{dest}'
+
+
+def today() -> str:
+    return time.strftime('%Y%m%d')
+
+
+DATE_NAME = re.compile(r'\d{8}-\d{4,}')          # -N 起的名字：20260923-0001
+NAI_NAME = re.compile(r' s-\d+$')                # NAI 下载的默认文件名：提示词开头 + s-种子
+
+
+def next_name(opts, folder: Path, ext: str) -> Path:
+    """-N：同一目录按 今天日期-0001 往后接号。已有的同日编号不论扩展名都跳过，
+    免得 0001.png 和 0001.webp 并存；dry-run 也占号，报出来的名字和真跑时一致。"""
+    date = today()
+    taken = vars(opts).setdefault('_numbers', {})
+    key = (str(folder.resolve()), date)
+    if key not in taken:
+        pat = re.compile(rf'{date}-(\d{{4,}})')
+        taken[key] = max((int(m.group(1)) for f in (folder.iterdir() if folder.is_dir() else ())
+                          if (m := pat.fullmatch(f.stem))), default=0)
+    taken[key] += 1
+    return folder / f'{date}-{taken[key]:04d}{ext.lower()}'
 
 
 def output_path(src: Path, rel: Path, opts) -> Path:
     if opts.in_place:
+        if opts.rename and not DATE_NAME.fullmatch(src.stem):     # 已经是编号名的就不再换号
+            return next_name(opts, src.parent, src.suffix)
         return src
     if opts.output:
         return Path(opts.output)
+    if opts.rename:
+        return next_name(opts, Path(opts.outdir) / rel.parent if opts.outdir else src.parent, src.suffix)
     if opts.outdir:
         return Path(opts.outdir) / rel
     return src.with_name(Path(rel.name).stem + suffix_of(opts) + src.suffix)   # rel 可能被 -w 改过词
@@ -384,6 +412,30 @@ def preset_path(name: str) -> Path:
     return preset_dir() / f'{name}.json'
 
 
+# 内置预设：都是「每块塞同一段」。自己存一个同编号的（nais -t edit 1）就盖过内置的
+BUILTIN_PRESETS = {
+    '1': ('空格', ' ' * 512),
+    '2': ('杂鱼', ', '.join(['杂鱼~♥'] * 64)),
+}
+
+
+def load_preset(name: str) -> dict | None:
+    """预设的内容：先找自己存的，没有再看内置；都没有返回 None。"""
+    p = preset_path(name)
+    if p.exists():
+        return load_meta_json(p)
+    if name in BUILTIN_PRESETS:
+        return fill_meta(BUILTIN_PRESETS[name][1])
+    return None
+
+
+def _builtin_desc(name: str) -> str:
+    label, text = BUILTIN_PRESETS[name]
+    unit = text.split(', ')[0]
+    what = f' {len(text)} 个半角空格' if not text.strip() else f'「{unit}」×{text.count(unit)}，逗号隔开'
+    return f'内置 · {label}：每块塞{what}'
+
+
 def save_preset(name: str, meta: dict) -> Path:
     preset_dir().mkdir(parents=True, exist_ok=True)
     p = preset_path(name)
@@ -392,18 +444,23 @@ def save_preset(name: str, meta: dict) -> Path:
 
 
 def list_presets() -> str:
-    files = sorted(preset_dir().glob('*.json'), key=lambda x: (len(x.stem), x.stem))
-    if not files:
-        return f'没有预设（用 nais -t edit 1 建一个，存在 {preset_dir()}）'
-    lines = [f'预设（{preset_dir()}）：']
-    for f in files:
+    files = {f.stem: f for f in preset_dir().glob('*.json')} if preset_dir().exists() else {}
+    names = sorted({*BUILTIN_PRESETS, *files}, key=lambda x: (not x.isdigit(), len(x), x))
+    lines = [f'预设（-t 编号；自己的存在 {preset_dir()}，nais -t edit 编号 新建或改）：']
+    for n in names:
+        if n not in files:
+            lines.append(f'  {n:>4}  {_builtin_desc(n)}')
+            continue
         try:
-            m = load_meta_json(f)
+            m = load_meta_json(files[n])
             c = m.get('Comment') if isinstance(m.get('Comment'), dict) else {}
             prompt = str(c.get('prompt') or m.get('Description') or '').replace('\n', ' ')
-            lines.append(f'  {f.stem:>4}  {prompt[:70]}{"…" if len(prompt) > 70 else ""}')
+            if not prompt.strip():
+                prompt = f'（{len(prompt)} 个空白字符）' if prompt else '（空）'
+            over = f'[盖过内置 {BUILTIN_PRESETS[n][0]}] ' if n in BUILTIN_PRESETS else ''
+            lines.append(f'  {n:>4}  {over}{prompt[:70]}{"…" if len(prompt) > 70 else ""}')
         except Exception as e:
-            lines.append(f'  {f.stem:>4}  <坏了: {e}>')
+            lines.append(f'  {n:>4}  <坏了: {e}>')
     return '\n'.join(lines)
 
 
@@ -421,10 +478,8 @@ def resolve_poison(opts, first: Path | None = None) -> int | None:
     if spec == 'edit' or spec.startswith(('edit:', 'edit ')):   # edit / edit:1 / edit 1
         from .edit import ask, edit_interactive
         name = spec[4:].lstrip(': ').strip() or None
-        base = None
-        if name and preset_path(name).exists():
-            base = load_meta_json(preset_path(name))
-        elif first is not None:
+        base = load_preset(name) if name else None
+        if base is None and first is not None:
             base = _orig_meta(first)
         size = Image.open(first).size if first is not None else (0, 0)
         meta = edit_interactive(make_meta(base, sets=opts.sets, size=size), name)
@@ -441,10 +496,11 @@ def resolve_poison(opts, first: Path | None = None) -> int | None:
         opts.poison_meta = make_meta(load_meta_json(Path(spec[1:]).expanduser()), sets=opts.sets)
         return None
     if spec.isdigit() or preset_path(spec).exists():     # 数字一律当预设；名字和现有预设撞上也当预设
-        if not preset_path(spec).exists():
+        base = load_preset(spec)
+        if base is None:
             print(f'没有预设 {spec}\n{list_presets()}', file=sys.stderr)
             return 1
-        opts.poison_meta = make_meta(load_meta_json(preset_path(spec)), sets=opts.sets)
+        opts.poison_meta = make_meta(base, sets=opts.sets)
     return None
 
 
@@ -476,10 +532,11 @@ def poison_for(src: Path, im: Image.Image, scan, opts) -> dict | None:
     if opts.poison_meta is not None:
         meta = copy.deepcopy(opts.poison_meta)
         c = meta['Comment']
-        c['width'], c['height'] = im.size
-        if c.get('seed') is None:
-            import random
-            c['seed'] = random.randrange(1, 2 ** 32)
+        if isinstance(c, dict):                  # 整段填充的预设 Comment 是原文，没有这些字段
+            c['width'], c['height'] = im.size
+            if c.get('seed') is None:
+                import random
+                c['seed'] = random.randrange(1, 2 ** 32)
         return meta
     if opts.poison:                              # -t '内容'：每个分块都塞这段
         return fill_meta(opts.poison, opts.sets)
@@ -613,6 +670,10 @@ def strip_one(src: Path, rel: Path, opts) -> tuple[bool, str]:
             found += [d for d in done if d.startswith('隐写')]
 
         if not found and not done:
+            if opts.in_place and dst != src:     # -i -N：没元数据也把名字换掉
+                if not opts.dry_run:
+                    os.replace(src, dst)
+                return True, f'· {tag}   没发现元数据，只改名'
             if opts.in_place:
                 return True, f'· {tag}   没发现元数据，不动'
             notes.append('没发现元数据，照样写了一份干净副本')
@@ -634,6 +695,8 @@ def strip_one(src: Path, rel: Path, opts) -> tuple[bool, str]:
         else:
             left = verify(dst)
         size = f'{fmt_size(src.stat().st_size)} → {fmt_size(dst.stat().st_size)}' if dst != src else fmt_size(dst.stat().st_size)
+        if opts.in_place and dst != src:         # -i -N：新名字那份写好了，旧文件删掉
+            src.unlink()
         if words_meta is not None:
             hit_desc = ' · '.join(f'{k} ×{n}' for k, n in hits.items())
             line = f'{SYM["ok"]} {tag}   改词: {hit_desc} · {[d for d in done if d.startswith(label)][0] if any(d.startswith(label) for d in done) else label}   {size}'
@@ -667,9 +730,13 @@ def main(argv=None) -> int:
     g.add_argument('-d', '--outdir', metavar='DIR', help='输出目录，保持原文件名；目录输入时保留相对层级')
     g.add_argument('-i', '--in-place', action='store_true', help='原地覆盖原文件（不留备份）')
     ap.add_argument('--suffix', default=None, help='不指定 -o/-d/-i 时写在原图旁边，文件名加此后缀（默认 _clean，投毒时 _poison）')
+    ap.add_argument('-N', '--rename', action='store_true', help=(
+        '输出改名成 今天日期-编号（20260923-0001…），同一目录接着已有的号往后排。NAI 默认文件名开头是提示词、结尾是种子，'
+        '擦了元数据名字照样漏；配 -i 就是原地改名，旧文件删掉'))
     ap.add_argument('-t', '--poison', metavar='内容', help=(
         "剥完再写入假元数据（投毒，文本块/EXIF 与隐写两层都写）：-t '内容' 每个分块都塞这段；"
-        '-t 1 用预设 1；-t edit 在终端里逐字段改，-t edit 1 改并存为预设 1；-t @文件.json 用现成模板；-t list 列预设'))
+        '-t 1 内置预设「空格」，-t 2 内置预设「杂鱼~♥」×64；-t 3 起是自己的预设；'
+        '-t edit 3 在终端里逐字段改并存为预设 3（edit 1/2 就是改内置那两个）；-t @文件.json 用现成模板；-t list 列预设'))
     ap.add_argument('--set', action='append', default=[], metavar='键=值',
                     help='改单个字段，可重复：--set seed=7 --set uc=lowres；单独用时以原图元数据为底')
     ap.add_argument('-w', '--words', action='append', default=[], metavar='规则|词表', help=(
@@ -716,6 +783,9 @@ def main(argv=None) -> int:
     if a.output and len(items) > 1:
         print('-o 只能配一个输入文件；多个文件请用 -d 输出目录', file=sys.stderr)
         return 1
+    if a.output and a.rename:
+        print('-o 已经指定了文件名，不能再 -N 改名', file=sys.stderr)
+        return 1
     # 文件夹 / 通配符是批量操作，先报数量再问一句；逐个点名的文件不问
     batch = [p for p in a.paths if Path(p).is_dir() or any(ch in p for ch in GLOB_CHARS)]
     if batch and not a.yes and not a.dry_run:
@@ -732,7 +802,21 @@ def main(argv=None) -> int:
         fail += not good
     if len(items) > 1:
         print(f'—— 共 {len(items)} 张：成功 {ok}，失败/跳过 {fail}')
+    hint = name_hint(items, a)
+    if hint:
+        print(hint)
     return 1 if fail else 0
+
+
+def name_hint(items, opts) -> str:
+    """文件名是 NAI 默认命名（提示词开头 + s-种子）而又没改名时提醒一句。"""
+    if opts.rename or opts.output:
+        return ''
+    n = sum(bool(NAI_NAME.search(src.stem)) for src, _ in items)
+    if not n:
+        return ''
+    return (f'{SYM["warn"]} {"这张" if len(items) == 1 else f"其中 {n} 张"}的文件名是 NAI 默认命名（开头是提示词、结尾 s-种子），'
+            f'元数据擦了名字还在；加 -N 改成 {today()}-0001 这种')
 
 
 if __name__ == '__main__':
