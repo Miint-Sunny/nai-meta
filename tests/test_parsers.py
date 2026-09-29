@@ -1,6 +1,5 @@
 # -*- coding: utf-8 -*-
-"""真图里见到的各种情况：两层正常差异、枚举 Source、Enhance、Director Tools、inpaint 子字典、A1111 格式。"""
-import json
+"""实际图片中出现的情况：两层的正常差异、枚举形式的 Source、Enhance、导演工具、局部重绘的子对象、A1111 格式。"""
 
 from nai_meta.core import diff_meta, meta_from_text, parse_a1111, summarize
 
@@ -23,9 +22,9 @@ def test_diff_ignores_stealth_omitted_fields_and_signature():
 def test_model_name_from_hash_when_source_is_enum():
     s = summarize(_meta('DiffusionModelMetaName.NAIv4next 4BDE2A90'))
     assert s['model']['name'] == 'NovelAI Diffusion V4.5' and s['model']['hash'] == '4BDE2A90'
-    s = summarize({'Comment': {**BASE, 'model_hash': '0ADF9AB7'}})          # Source 整个丢了
+    s = summarize({'Comment': {**BASE, 'model_hash': '0ADF9AB7'}})          # 缺少 Source 字段
     assert s['model']['name'] == 'NovelAI Diffusion V5'
-    s = summarize(_meta('Stable Diffusion XL C1E1DE52'))                    # Source 正常时以它为准
+    s = summarize(_meta('Stable Diffusion XL C1E1DE52'))                    # Source 完整时以 Source 为准
     assert s['model'] == {'name': 'Stable Diffusion XL', 'hash': 'C1E1DE52', 'source': 'Stable Diffusion XL C1E1DE52', 'software': 'NovelAI'}
 
 
@@ -51,5 +50,5 @@ def test_parse_a1111_parameters():
     assert s['sampler'] == 'DPM++ 2M Karras' and s['noise_schedule'] == 'Karras'
     assert s['model'] == {'name': 'animagineXL', 'hash': '1a2b3c4d', 'source': None, 'software': 'Stable Diffusion WebUI'}
     assert s['type']['kind'] == 'a1111_img2img' and s['type']['strength'] == 0.55
-    assert meta_from_text(A1111)['Comment']['steps'] == 30      # EXIF UserComment 里的同款文本也认
+    assert meta_from_text(A1111)['Comment']['steps'] == 30      # EXIF UserComment 中的相同格式
     assert parse_a1111('just a caption') is None

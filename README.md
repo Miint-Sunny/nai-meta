@@ -1,100 +1,130 @@
-# nai-meta — NovelAI 图片元数据工具
+# nai-meta
 
-读、剥、改 NovelAI 出图里的元数据，像素一个都不动。纯 Python，macOS / Windows / Linux 都能跑。
+读取、移除和改写 NovelAI 生成图片中的元数据（PNG 文本块、EXIF 与 LSB 隐写），不修改像素数据。
 
-| 短名 | 子命令 | 完整名 | 干什么 |
-|---|---|---|---|
-| `naii` | `nai i` | `nai-inspect` | **读**：把生成参数排成一眼能看的版式，明文层和隐写层都读，两层都在时顺手比对 |
-| `nais` | `nai s` | `nai-strip` | **剥**：去掉文本块 / EXIF / LSB 隐写；`-t` 剥完写假的（投毒）；`-w` 不剥只换词；`nais tui` 拖图进终端就处理 |
-| `nai` | | | 伞形总入口：`nai i …` `nai s …`，不带参数打印用法，`nai -V` 看版本 |
+- [背景](#背景)
+- [安装](#安装)
+- [用法](#用法)
+  - [命令概览](#命令概览)
+  - [naii：读取生成参数](#naii读取生成参数)
+  - [nais：移除元数据](#nais移除元数据)
+  - [按日期重命名（-N）](#按日期重命名-n)
+  - [写入伪造元数据（-t）](#写入伪造元数据-t)
+  - [替换词语（-w）](#替换词语-w)
+  - [交互模式（nais tui）](#交互模式nais-tui)
+  - [退出码](#退出码)
+- [配置文件](#配置文件)
+- [工作原理](#工作原理)
+- [限制与注意事项](#限制与注意事项)
+- [相关项目](#相关项目)
+- [开发](#开发)
+- [许可证](#许可证)
 
-三种叫法完全等价，挑顺手的用。下文统一写 `naii` / `nais`。
+## 背景
 
-## 须知
+NovelAI 生成的图片包含两层内容相同的元数据：
 
-- **像素不动。** 剥、投毒、改词都只碰元数据；PNG 无损重编码，JPEG 和有损 WebP 在容器层按段操作，图像数据一个字节不改。
-  只有「有损 WebP 又带真透明」这一种情况必须重编码，工具会提示。
-- **NAI 的元数据有两层**：明文层（PNG 文本块，WebP 是 EXIF）和 alpha 通道最低位里的 LSB 隐写。novelai.net/inspect
-  读的是隐写层。只删文本块、或者只改文本块，都骗不过它。这里两层一起处理。
-- **`nais` 有三种互斥模式**，看开关就知道是哪种：不带 `-t` / `-w` = 全剥；`-t` = 剥完写假的；`-w` = 不剥，只把命中的词换掉。
-- **改过内容签名就作废。** NAI 会给元数据签名（`signed_hash`），投毒和改词之后必然对不上，工具直接去掉它，
-  `naii` 会显示无签名。这个没法伪造。
-- **默认不覆盖、不原地改。** 输出写在原图旁边加后缀（`_clean` / `_poison` / `_w` 或词表名），同名已存在就跳过，
-  `--overwrite` 才覆盖，`-i` 才原地。文件夹和通配符是批量操作，先报数量再问一句 y/N，`-y` 跳过。
-- **文件名也会泄露。** NAI 下载的默认文件名是「提示词开头 + ` s-种子`」，元数据擦得再干净，名字里照样写着。
-  `-N` 把输出改名成 `20260923-0001` 这种；没加 `-N` 又碰到这种文件名时，`nais` 会在最后提醒一句。
-- **写完都会回读验证。** 剥：三层都得为空；投毒：两层都得读出写入的内容；改词：旧词一个不剩。不通过标 ✗ 并说明。
-- **改词只是换字符串。** 匹配不分大小写、按子串，`Lolita` 也会变；精确匹配写正则。它应付的是平台按元数据里的词封图这种事，
-  词本身只是生图用的形象提示词。
-- **不是 NAI 的图也尽量认**：A1111 / Forge 的 `parameters` 文本、ComfyUI 工作流、相机 JPEG，能读的读，不能读的报一句。
-- **Windows**：cmd / PowerShell 不替外部程序展开 `*.png`，工具自己展开；stdout 重定向到文件时强制 UTF-8；
-  老式窗口字体缺 ✔ ▸ 这类符号时自动换成 √ > !（`NAI_META_ASCII=1` / `0` 强制）。带空格的路径照常加引号。
-  实测在 macOS 上做的，Windows 没有真机验证。
-- 隐写层能读的前提是图没被重编码过：转 JPEG、缩放、二压都会毁掉它。QQ / 微信转发会剥掉文本块但通常保留隐写。
+- **明文层**：PNG 使用文本块，WebP 使用 EXIF。exiftool 等通用工具可以读取；转发平台通常会移除这一层。
+- **LSB 隐写层**：写入 alpha 通道各像素的最低位。novelai.net/inspect 读取的是这一层；只要图像没有重新编码，这一层就会保留。
+
+只移除明文层无法清除生成参数。现有能清除隐写层的开源工具会删除整个 alpha 通道。nai-meta 同时处理两层：
+对隐写层，只恢复被隐写数据占用的最低位，其余像素保持原值。
+
+nai-meta 提供以下功能：
+
+- 读取生成参数，并比对两层内容是否一致。
+- 移除全部元数据。
+- 移除后写入伪造元数据（下文称“投毒”）。
+- 仅替换元数据中的指定词语，其余内容保持不变。
 
 ## 安装
 
-依赖 Pillow、numpy、prompt_toolkit，全是纯 Python，用 uv 管理，不用自己建 venv：
+需要 [uv](https://docs.astral.sh/uv/)。uv 会自动安装所需的 Python（3.10 或更高版本），并为本工具创建独立环境。
+
+从 GitHub 安装：
 
 ```bash
-uv tool install git+https://github.com/Miint-Sunny/nai-meta      # 装成全局命令，uv 给它建独立环境
+uv tool install git+https://github.com/Miint-Sunny/nai-meta
 ```
 
-| 场景 | 命令 |
+也可以克隆仓库后从本地源码安装：
+
+```bash
+git clone https://github.com/Miint-Sunny/nai-meta.git
+cd nai-meta
+uv tool install .
+```
+
+检查是否安装成功：
+
+```bash
+nais --version
+```
+
+| 操作 | 命令 |
 |---|---|
-| 克隆后本地装 | 仓库里 `uv tool install .` |
-| 更新 / 改了代码或命令名 | `uv tool install . --reinstall` 或重跑上面的 git 安装 |
-| 不装一次性跑 | `uvx --from git+https://github.com/Miint-Sunny/nai-meta naii a.png` |
-| 开发期 | 仓库里 `uv run naii a.png`（自动建 `.venv`）；测试 `uv run pytest` |
+| 更新（从 GitHub 安装） | `uv tool install --reinstall git+https://github.com/Miint-Sunny/nai-meta` |
+| 更新（从本地源码安装） | 在仓库目录中执行 `git pull`，再执行 `uv tool install . --reinstall` |
+| 不安装，直接运行一次 | `uvx --from git+https://github.com/Miint-Sunny/nai-meta naii a.png` |
 | 卸载 | `uv tool uninstall nai-meta` |
 
-Windows：
+在 Windows 上，先在 PowerShell 中安装 uv，再执行上面的安装命令，最后把命令目录加入 PATH：
 
 ```powershell
-powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"   # 装 uv
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
 uv tool install git+https://github.com/Miint-Sunny/nai-meta
-uv tool update-shell                     # 把 %USERPROFILE%\.local\bin 加进 PATH，重开终端
+uv tool update-shell
 ```
 
-命令名在 `pyproject.toml` 的 `[project.scripts]` 里，左边就是命令名，改完 `uv tool install . --reinstall`。
+执行 `uv tool update-shell` 后，需要重新打开终端。
 
-## naii：读参数
+## 用法
+
+### 命令概览
+
+| 命令 | 等价写法 | 功能 |
+|---|---|---|
+| `naii` | `nai i`、`nai-inspect` | 读取生成参数 |
+| `nais` | `nai s`、`nai-strip` | 移除元数据；使用 `-t` 时写入伪造元数据；使用 `-w` 时替换词语；`nais tui` 进入交互模式 |
+| `nai` | | 统一入口，不带参数时显示用法 |
+
+各命令均支持 `-h` 查看完整选项，支持 `-V` 查看版本。下文统一使用 `naii` 和 `nais`。
+
+### naii：读取生成参数
 
 ```bash
-naii a.png b.png             # 人读版式
-naii -r ./图库               # 目录递归
-naii -p a.png | pbcopy       # 只输出正向提示词（含角色），直接复制
-naii -j a.png > a.json       # JSON：文本块、隐写、EXIF、整理后的 params 全在
-naii -f a.png                # 附带 Comment 里的全部字段
-naii --raw a.png             # 附带原始文本块 / 隐写 JSON 字符串
-naii --stealth a.png         # 只用隐写层（怀疑明文层被改过时）
-naii --text a.png            # 只用明文层（PNG 文本块 / WebP 的 EXIF）
+naii a.png b.png             # 显示生成参数
+naii -r ./images             # 递归读取目录
+naii -p a.png | pbcopy       # 仅输出正向提示词（含角色提示词），复制到剪贴板（macOS）
+naii -j a.png > a.json       # 以 JSON 格式输出
+naii --stealth a.png         # 仅读取隐写层
 ```
 
 | 选项 | 说明 |
 |---|---|
-| `-r` `--recursive` | 目录递归 |
-| `--text` / `--stealth` | 只用明文层 / 只用隐写层（默认明文层优先，没有再看隐写） |
-| `-f` `--full` | 把 Comment 里的全部字段也打出来 |
-| `--raw` | 附带原始文本块 / 隐写 JSON 字符串 |
-| `-j` `--json` | JSON 输出，单图一个对象，多图为数组 |
-| `-p` `--prompt` | 只输出正向提示词（含角色），多图时用 `# ===== 文件名` 分隔 |
+| `--text` | 仅读取明文层（PNG 文本块或 WebP 的 EXIF） |
+| `--stealth` | 仅读取 LSB 隐写层 |
+| `-f`, `--full` | 显示 Comment 中的全部字段 |
+| `--raw` | 附加显示原始文本块与隐写层 JSON |
+| `-j`, `--json` | 以 JSON 格式输出。单个文件输出为对象，多个文件输出为数组 |
+| `-p`, `--prompt` | 仅输出正向提示词与角色提示词。多个文件以 `# ===== 文件名` 分隔 |
+| `-r`, `--recursive` | 递归处理子目录 |
 
-输出示例：
+默认先显示明文层；明文层不存在时，显示隐写层。输出示例：
 
 ```
 ━━ a.png   PNG · RGBA · 2176×896
-元数据    文本块 ✓ 6 · 隐写 ✓ alpha+gzip 12406 B · 两层一致 · 读自文本块
+元数据    文本块 ✓ 6 个 · 隐写 ✓ alpha+gzip 12406 B · 两层一致 · 显示来源：文本块
 
 模型      NovelAI Diffusion V5 · 哈希 0ADF9AB7
 类型      图生图 i2i · 强度 0.7 · 噪声 0.8
 附加      Vibe Transfer ×2（强度 0.6, 0.35 · 信息提取 1, 0.8） · 角色参考 ×1（强度 1）
 尺寸      2176×896   耗时 6.6 s
-采样      Euler Ancestral (k_euler_ancestral) · karras · 28 steps
+采样      Euler Ancestral (k_euler_ancestral) · karras · 28 步
 引导      Prompt Guidance 5.5 · Rescale 0.2
 种子      1699232568
 开关      Variety+ · 质量标签 · UC 预设 #2
-签名      有（NAI 签名 7Pc89N+E8gjW…，未验证）
+签名      7Pc89N+E8gjW…（未验证）
 
 ─── 正向 ──────────────────────────────────────────────────────
 1girl, ...
@@ -109,99 +139,131 @@ nsfw, lowres, ...
 hat
 ```
 
-- **元数据行**：哪几层存在、隐写多大、两层是否一致、这次显示的是哪一层。两层都是 NAI 数据但不一致时标 ⚠ 并列出差异字段
-  （隐写层本来就不存 vibe 参考图这类大字段，两层各自签名，这些正常差异不算）。
-- **类型**：文生图 / 图生图 i2i / 局部重绘 inpaint / 增强 Enhance / 导演工具（emotion、lineart 等，带 defry）；i2i 系带强度和噪声。
-- **附加**：Vibe Transfer、角色参考、ControlNet，有几个列几个，带强度。
-- **开关**：只列打开的：Variety+、Decrisper、SMEA、质量标签、UC 预设、透明背景、Upscale、角色坐标。
-- **角色区块**按 NAI 的角色序号编号，负面区块的「角色 2」就是正向的「角色 2」；开了角色坐标时标出位置。
-- 尺寸与文件实际尺寸不一致（放大过）时两个都显示。模型名从 Comment 取，缺了就从 Source 拆，再不行按哈希表兜底。
-- 不是 NAI 的图：A1111 / Forge 的 `parameters` 文本（PNG 文本块或 EXIF UserComment 里的）解析成同样版式；
-  ComfyUI 工作流报节点数；其余文本块和 EXIF 原样列出，长的只报长度，`-f` 看全文。
+各行说明：
 
-## nais：剥元数据
+| 行 | 内容 |
+|---|---|
+| 元数据 | 存在哪些层、隐写数据的大小、两层是否一致，以及当前显示的是哪一层。两层均为 NovelAI 元数据但内容不同时，标出 ⚠ 并列出差异字段。以下差异属于正常情况，不计入：两层的签名各自独立；隐写层不保存参考图等大字段 |
+| 类型 | 文生图、图生图、局部重绘、增强（Enhance）或导演工具（emotion、lineart 等，附 defry 值）。图生图类显示强度和噪声 |
+| 附加 | Vibe Transfer、角色参考、ControlNet 及其强度 |
+| 尺寸 | 生成尺寸。与文件的实际尺寸不同时（例如图片经过放大），两者都显示 |
+| 开关 | 仅列出已启用的项：Variety+、Decrisper、SMEA、质量标签、UC 预设、透明背景、Upscale、角色坐标 |
+| 角色区块 | 按 NovelAI 的角色序号编号，负面区块中的“角色 2”对应正向区块中的“角色 2”。启用角色坐标时，同时显示坐标 |
+
+模型名的取值顺序：先取 Comment 中的模型名；没有时从 Source 字段解析；仍无法确定时，按模型哈希对照表识别。
+
+也能读取非 NovelAI 格式：
+
+- A1111、Forge 的 `parameters` 文本（位于 PNG 文本块或 EXIF UserComment）以相同格式显示。
+- ComfyUI 工作流只显示节点数。
+- 其他文本块和 EXIF 字段按原样列出；过长的内容只显示长度，使用 `-f` 显示全文。
+
+### nais：移除元数据
 
 ```bash
-nais a.png                    # → a_clean.png（写在原图旁边）
-nais a.png -o 干净.png         # 指定输出文件
-nais -r ./图库 -d ./干净       # 整个目录，输出目录里保持相对层级
-nais -i *.png                 # 原地覆盖，不留备份
-nais a.png -N                 # → 20260923-0001.png（改成 日期-编号，见下面「-N」）
-nais -n ./图库                 # dry-run：只报告会去掉什么
+nais a.png                    # 输出 a_clean.png，与源文件位于同一目录
+nais a.png -o clean.png       # 指定输出文件
+nais -r ./images -d ./clean   # 递归处理目录，输出目录中保留相对路径
+nais -i *.png                 # 直接修改源文件，不保留原文件
+nais -n ./images              # 试运行，只报告将执行的操作
 ```
 
 | 选项 | 说明 |
 |---|---|
-| `-r` `--recursive` | 目录递归 |
-| `-o FILE` / `-d DIR` / `-i` | 输出文件（单输入）/ 输出目录 / 原地覆盖，三选一 |
-| `--suffix X` | 写在原图旁边时的后缀（默认 `_clean`，投毒 `_poison`，改词 `_w` 或词表名） |
-| `-N` `--rename` | 输出改名成 `今天日期-编号`，同一目录接着已有的号往后排；配 `-i` 就是原地改名 |
-| `--drop-alpha` | alpha 全不透明时去掉 alpha 通道存成 RGB，文件更小 |
-| `--scrub-all` | 所有通道所有像素的最低位清零，应付未知隐写变种（颜色最多变 1/255） |
-| `--strip-icc` | 连 ICC 色彩配置也去掉（默认保留，它不含生成信息） |
-| `--overwrite` | 输出已存在时覆盖（默认跳过） |
-| `--no-verify` | 写完不回读验证 |
-| `-n` `--dry-run` | 只报告，不写 |
-| `-y` `--yes` | 处理文件夹 / 通配符时不问 y/N |
-| `-t` `--set` `-w` | 投毒 / 改字段 / 改词，见下面三节 |
+| `-o FILE` | 输出文件，只能用于单个输入文件 |
+| `-d DIR` | 输出目录。输入为目录时，保留相对路径 |
+| `-i` | 直接修改源文件，不保留原文件 |
+| `--suffix SUFFIX` | 输出到源文件所在目录时追加的文件名后缀。默认为 `_clean`；使用 `-t` 时为 `_poison`；使用 `-w` 时为词表名或 `_w` |
+| `-N`, `--rename` | 按“日期-序号”重命名输出文件，详见[下文](#按日期重命名-n) |
+| `--overwrite` | 覆盖已存在的输出文件。默认跳过 |
+| `-t SPEC` / `--set KEY=VALUE` / `-w RULE` | 写入伪造元数据、修改单个字段、替换词语，详见下文 |
+| `--drop-alpha` | alpha 通道完全不透明时移除该通道，输出 RGB 图像 |
+| `--scrub-all` | 清零所有通道的最低位，用于处理未知格式的隐写。每个颜色分量最多变化 1 |
+| `--strip-icc` | 同时移除 ICC 色彩配置文件。默认保留，因为它不含生成信息 |
+| `-r`, `--recursive` | 递归处理子目录 |
+| `-n`, `--dry-run` | 试运行：报告将执行的操作，不写入文件 |
+| `-y`, `--yes` | 处理目录或通配符时，不请求确认 |
+| `--no-verify` | 跳过写入后的回读验证 |
 
-批量确认长这样：
+`-o`、`-d`、`-i` 只能三选一。三者都不指定时，输出到源文件所在目录。
+
+输入包含目录或通配符时，处理前会显示文件数量和输出位置，并请求确认。逐个指定的文件不请求确认。
 
 ```
-$ nais ./图库
-./图库：12 张（png 10 · jpg 2）→ 原图旁边 +_clean
-继续？[y/N]（-y 可跳过确认）
+$ nais ./images
+./images：共 12 个文件（png 10、jpg 2），输出到源文件所在目录，文件名追加 _clean
+是否继续？[y/N] y
+✔ a.png → a_clean.png  已移除文本块 ×6（Title、Description、…）、LSB 隐写（alpha+gzip 4726 B）；alpha 已恢复为 255；1.64 MiB → 1.65 MiB
+✔ b.jpg → b_clean.jpg  已移除 APP1/EXIF-XMP 段（6.06 KiB）；812.40 KiB → 806.34 KiB
+· c.png  已跳过：输出文件 c_clean.png 已存在（使用 --overwrite 覆盖）
+…
+完成：共 12 个文件，成功 11 个，跳过 1 个，失败 0 个
 ```
 
-各格式具体做了什么：
+每个文件写入后都会重新读取并验证：移除模式下，输出文件中不能残留任何元数据；写入模式下，两层都必须读出写入的内容。验证未通过的文件标记为 ✗，并列出原因。
 
-- **PNG**：解出像素 → 只擦隐写占用的那些最低位（头 + 数据 + FEC 段覆盖到的像素）→ 不带任何文本块重新编码。
-  隐写占用区里被改成 254 的 alpha 归回 255，占用区外一位不碰；带真透明的图透明保留。
-  NAI 的 WebP 边缘常有几个 239、251 这样的像素，它们照原样留着，不影响占用区归 255。文件大小会变（压缩等级不同），
-  pHYs 之类无关紧要的块也一并没了。
-- **JPEG**：按段过滤，丢 APP1（EXIF/XMP）、APP13（Photoshop/IPTC）、COM 等，保留 APP0（JFIF）、APP14（Adobe 色彩变换标记，
-  去了会偏色）、可选 APP2（ICC）。扫描数据一个字节不动。
-- **WebP**：NAI 网站的 WebP 下载 = 无损 VP8L + alpha 隐写 + EXIF。提示词带中文时，NAI 会在 EXIF 的 Description
-  前面多写 4 个 NUL 字节，隐写层里没有；读的时候去掉，不算两层不一致。无损的走像素路线无损重存；有损且 alpha 全不透明的在
-  RIFF 容器层直接丢掉 ALPH / EXIF / XMP 块，RGB 数据不动；有损又带真透明的只能有损重编码，会提示。动图只去容器层元数据。
-- **其他格式**：Pillow 重编码，有损，会提示。
+各格式的处理方式：
 
-跟别的工具的区别：现有能抹 LSB 的开源工具都是把整个 alpha 通道砍掉。这里只清隐写占用的位，归回去和生成时一模一样。
+| 格式 | 处理方式 |
+|---|---|
+| PNG | 移除全部文本块（tEXt、iTXt、zTXt）、eXIf 与 tIME；清除隐写数据占用的最低位，然后无损重新编码。隐写区域内被改为 254 的 alpha 恢复为 255，区域外的像素保持原值，真实的透明度不受影响。文件大小可能因压缩参数不同而变化 |
+| JPEG | 按段处理：移除 APP1（EXIF、XMP）、APP13（Photoshop、IPTC）、COM 等段；保留 APP0（JFIF）、APP14（Adobe 色彩变换标记，移除会导致偏色）和 APP2（ICC，可选）。扫描数据不变，不重新编码 |
+| WebP | NovelAI 网站提供的 WebP 为无损 VP8L 格式，按 PNG 的方式处理后无损重新编码。有损且 alpha 完全不透明的文件，在 RIFF 容器层移除 ALPH、EXIF、XMP 块，VP8 数据不变。有损且含透明像素的文件只能有损重新编码，处理时会提示。动图只移除容器层元数据 |
+| 其他 | 由 Pillow 重新编码，画质会有损失，处理时会提示 |
 
-### `-N`：改名成日期编号
+### 按日期重命名（-N）
+
+NovelAI 默认的下载文件名由提示词开头和 ` s-<种子>` 组成。移除元数据后，文件名中仍保留这些信息。
+使用 `-N` 后，输出文件改为“日期-序号”格式的文件名。
 
 ```bash
-nais ./图库 -N                  # 旁边写 20260923-0001.png、-0002.png…，原图不动
-nais ./图库 -N -d ./干净         # 输出目录里编号；-r 时每个子目录各自从 0001 起
-nais ./图库 -N -i               # 原地改名：剥完写成新名字，旧文件删掉
+nais ./images -N               # 输出 20260929-0001.png、20260929-0002.png…，源文件保留
+nais ./images -N -d ./clean    # 在输出目录中编号；使用 -r 时，每个子目录分别从 0001 开始
+nais ./images -N -i            # 重命名源文件：写入新文件名后删除原文件
 ```
 
-- 日期是处理当天（本机时间）。同一目录里已经有当天的编号，就接着最大的往后排；
-  不管扩展名，`0003.webp` 占了号，下一张 png 就是 `0004`。别的日期的编号不影响。
-- 原图名字已经是 `yyyymmdd-NNNN` 的，`-i -N` 不给它换号，原地剥。没有元数据的图配 `-i -N` 只改名。
-- dry-run 也按真跑的顺序报出每张会叫什么。`-o` 已经给了文件名，不能和 `-N` 一起用。
-- 编号是按处理顺序给的，和原图名字对不上号；想留对应关系就别用 `-N`，或者先 `-n` 看一眼。
+- 日期为处理当天的本地日期。目标目录中已有当天的编号时，从最大编号的下一个开始，不区分扩展名：已有 `0003.webp` 时，下一个 PNG 文件为 `0004.png`。其他日期的编号不影响排序。
+- 与 `-i` 同时使用时，文件名已是“日期-序号”格式的文件保留原名；不含元数据的文件只重命名。
+- 试运行时，按实际运行的顺序报告每个文件的新文件名。
+- `-N` 不能与 `-o` 同时使用。
+- 序号按处理顺序分配，与原文件名没有对应关系。需要保留对应关系时，先用 `-n` 试运行并记录输出。
 
-### `-t`：投毒
+未使用 `-N`，而输入的文件名为 NovelAI 默认格式时，`nais` 会在处理结束后输出一条警告。
 
-剥干净之后再写一套假的进去，明文层和隐写层都写。不带 `-t` 就是全部擦掉，什么都不写。
+### 写入伪造元数据（-t）
+
+先移除全部元数据，再写入指定内容。明文层和隐写层都会写入。
 
 ```bash
-nais a.png -t 1                 # 内置预设 1「空格」：每块塞 512 个半角空格
-nais a.png -t 2                 # 内置预设 2「杂鱼」：每块塞「杂鱼~♥, 杂鱼~♥, …」共 64 个
-nais a.png -t '杂鱼'            # 每个分块都塞这段：六个文本块 + 隐写全是「杂鱼」 → a_poison.png
-nais a.png -t 3                 # 用自己的预设 3（整套字段：seed、模型、提示词都按预设）
-nais -t edit 3                  # 终端里逐字段改，存为预设 3；不带图片就只是建预设（写成 edit:3 也行）
-nais a.png -t edit              # 以这张图的元数据为底临时改一份，用完可选存为预设
-nais a.png -t @模板.json         # 用现成 JSON
-nais -t list                    # 列出预设
-nais a.png -t '杂鱼' --set seed=7          # 填充之余改单个字段；动了 Comment 内部字段时 Comment 变成 JSON
+nais a.png -t 1                  # 内置预设 1：所有字段写入 512 个半角空格
+nais a.png -t 2                  # 内置预设 2：所有字段写入“杂鱼~♥”，共 64 个，以逗号分隔
+nais a.png -t 'TEXT'             # 所有字段写入 TEXT
+nais a.png -t 3                  # 使用用户预设 3
+nais -t edit 3                   # 在终端中编辑，并保存为预设 3；不指定图片时只编辑预设（也可写作 edit:3）
+nais a.png -t edit               # 以该图片的元数据为基础编辑，完成后可选择保存为预设
+nais a.png -t @template.json     # 使用 JSON 模板
+nais -t list                     # 列出全部预设
 ```
 
-`-t edit` 的界面在终端里，先列出每一块和 Comment 里的关键字段：
+内置预设：
+
+| 编号 | 名称 | 写入内容 |
+|---|---|---|
+| 1 | 空格 | 512 个半角空格。元数据查看工具显示为空，导入 NovelAI 时提示词为空 |
+| 2 | 杂鱼 | `杂鱼~♥, 杂鱼~♥, …`，共 64 个 |
+
+“所有字段”指六个明文字段（Title、Description、Software、Source、Generation time、Comment）和隐写层中的对应字段。
+
+用户预设保存在 `~/.config/nai-meta/presets/<编号或名称>.json`，建议从 3 开始编号。与内置预设同编号的用户预设会覆盖内置预设，`-t list` 会标出覆盖关系；删除该文件后，恢复使用内置预设。
+`-t` 的参数与已有预设的名称相同时，使用该预设；否则将参数作为写入文本。
+
+写入时，宽和高按每张图像的实际尺寸设置；预设中 seed 为 `null` 时，为每个文件生成随机值。
+JPEG 和有损 WebP 没有可以写入隐写数据的 alpha 通道，只写入 EXIF。RGB 格式的 PNG 会先添加一个完全不透明的 alpha 通道，再写入隐写数据。
+
+`-t edit` 在终端中列出六个明文字段和 Comment 中的常用字段：
 
 ```
-━━ 编辑投毒内容（预设 1）
+━━ 编辑伪造元数据（预设 3）
   1  Title            NovelAI generated image
   2  Description      1girl, solo, …
   3  Software         NovelAI
@@ -210,142 +272,169 @@ nais a.png -t '杂鱼' --set seed=7          # 填充之余改单个字段；动
   6  prompt           1girl, solo, …
   7  uc               nsfw, lowres, …
   8  seed             1699232568
-  9  steps            28
- 10  scale            5.5
  ...
 edit ›
 ```
 
 | 输入 | 作用 |
 |---|---|
-| 编号 | 改那一项，当前值预填好直接改；prompt、uc、Description 是多行的，Enter 换行，Esc 再 Enter 提交，Ctrl-C 放弃 |
-| `键=值` | 直接改任何字段，Comment 里没列出来的也行，值按 JSON 解析；`seed=null` 表示每张随机 |
-| `:all 内容` | 一键把每块都塞成同一段 |
-| `:json` | 用 `$VISUAL` / `$EDITOR` 改完整 JSON，改完回到这里（没设就 nano，Windows 是记事本） |
-| `:w` / `:q` / 回车 | 保存 / 取消 / 重看列表 |
+| 编号 | 修改对应字段，输入框中预填当前值。prompt、uc 和 Description 支持多行输入：Enter 换行，按 Esc 后再按 Enter 提交，Ctrl-C 放弃修改 |
+| `KEY=VALUE` | 设置任意字段，包括列表中未显示的 Comment 字段。值按 JSON 解析；`seed=null` 表示每个文件随机生成 |
+| `:all TEXT` | 将所有字段设为同一文本 |
+| `:json` | 在 `$VISUAL` 或 `$EDITOR` 指定的编辑器中编辑完整 JSON。未设置时，使用 nano；Windows 使用记事本 |
+| `:w`、`:q`、回车 | 保存；取消；重新显示列表 |
 
-- 内置两个预设开箱即用，`-t list` 能看到：
-
-  | 编号 | 名字 | 每一块（六个文本块 + 隐写 + Comment）写成 |
-  |---|---|---|
-  | 1 | 空格 | 512 个半角空格。看元数据的工具里一片空白，拖进 NAI 提示词框也是空的 |
-  | 2 | 杂鱼 | `杂鱼~♥, 杂鱼~♥, …` 共 64 个 |
-
-  `-t edit 1` / `-t edit 2` 以内置内容为底改，存下来就盖过内置的（`-t list` 会标出来）；删掉那个文件就回到内置。
-  自己的新预设从 3 起编。
-- 预设在 `~/.config/nai-meta/presets/<编号或名字>.json`。`-t 名字` 时有同名预设就用预设，没有就当填充内容。
-- 预设写入时 width / height 按每张图实际尺寸，seed 为 null 则每张随机。
-- JPEG 和有损 WebP 没有能装隐写的 alpha，只写 EXIF。RGB 的 PNG 会补一层全 255 的 alpha 来装隐写。
-
-### `--set`：改单个字段
+`--set KEY=VALUE` 用于修改单个字段，可以重复使用，值按 JSON 解析。单独使用时，以源文件的元数据为基础，只修改指定字段；与 `-t` 同时使用时，在 `-t` 的内容上修改。
 
 ```bash
-nais a.png --set seed=7 --set uc=lowres    # 以原图元数据为底，只改这几个字段，提示词原样 → a_poison.png
+nais a.png --set seed=7 --set uc=lowres    # 输出 a_poison.png，只修改 seed 和负面提示词
 ```
 
-可重复；值按 JSON 解析，不合法就当字符串。和 `-t` 一起用时叠加在 `-t` 之上。
+### 替换词语（-w）
 
-### `-w`：只改词
-
-有些平台按元数据里的词封图。这时候不想全剥，只想把那几个词换掉，其余提示词、seed、模型一个不动：
+部分平台会根据元数据中的特定词语处理图片。`-w` 不移除元数据，只替换命中的词语，其余内容保持不变。
 
 ```bash
-nais a.png -w discord             # 用词表 discord（内置 loli→1011）→ a_discord.png
-nais a.png -w loli=1011           # 单条规则 → a_w.png
-nais a.png -w discord -w foo=bar  # 可叠加
-nais -w edit discord              # 终端里改词表，存在 ~/.config/nai-meta/words/discord.txt
-nais -w list                      # 列词表（没有文件的是内置）
+nais a.png -w discord              # 使用词表 discord（内置规则：loli→1011），输出 a_discord.png
+nais a.png -w loli=1011            # 使用单条规则，输出 a_w.png
+nais a.png -w discord -w foo=bar   # 多个参数的规则依次合并
+nais -w edit discord               # 在终端中编辑词表
+nais -w list                       # 列出全部词表
 ```
 
-- 读出原图两层元数据，递归替换里面所有字符串（正向、负面、角色、Description 全覆盖），写回明文层和隐写层。
-- **输出文件名里的词也一并换**：NAI 直接下载的文件名就是提示词。
-- 匹配不分大小写、按子串；精确匹配写正则：`-w '/\bloli\b/=1011'`。
-- 没有 NAI 元数据或没命中任何词的图不动。和 `-t` 互斥。
+- 读取源文件的元数据，替换其中所有字符串（正向提示词、负面提示词、角色提示词、Description 等），再写回明文层和隐写层。
+- 输出文件名中的词语也会替换，因为 NovelAI 默认的文件名包含提示词。
+- 匹配方式为子串匹配，不区分大小写。需要精确匹配时，使用正则表达式：`-w '/\bloli\b/=1011'`。
+- 词表保存在 `~/.config/nai-meta/words/<名称>.txt`，每行一条 `OLD=NEW` 规则，以 `#` 开头的行为注释。
+- 不含 NovelAI 元数据的文件和未匹配任何规则的文件都会跳过，不生成输出文件。
+- `-w` 与 `-t` 不能同时使用。
 
-`-w edit` 的界面：`旧=新` 添加或改一条，`-旧` 或 `-编号` 删一条，`:w` 保存，`:q` 取消，回车重看。
-词表文件一行一条 `旧=新`，`#` 开头是注释，可以直接手改。
-
-### `nais tui`：拖图进来就处理
+### 交互模式（nais tui）
 
 ```bash
-nais tui              # 或 nai s tui / nai-strip tui；nais tui ./干净 = 进去顺便把输出目录设好
+nais tui              # 也可以写作 nai s tui 或 nai-strip tui
+nais tui ./clean      # 启动时将输出目录设为 ./clean
 ```
 
-把图片或文件夹从 Finder / 资源管理器拖进终端窗口，回车就按当前设置处理并打印结果；文件夹先报数量再问 y/N，
-一次拖多个也行。底部状态栏一直显示当前设置，斜杠命令切换：
+将图片或目录从 Finder 或文件资源管理器拖入终端，按回车后，按当前设置处理并显示结果。一次可以拖入多个文件；目录会先显示文件数量，并请求确认。
+底部状态栏显示当前设置，以 `/` 开头的命令用于修改设置：
 
 | 命令 | 作用 |
 |---|---|
-| `/out <目录>` | 输出到指定目录（可以把文件夹拖进来当参数）；`/out -` 恢复写在原图旁边 |
-| `/suffix <后缀>` | 旁边模式的文件名后缀 |
-| `/i` | 切换原地覆盖（不留备份，会警告） |
-| `/n` | 切换改名成 `日期-编号`；和 `/i` 一起就是原地改名 |
-| `/alpha` `/icc` `/scrub` | 切换去 alpha / 去 ICC / 全通道 LSB 清零 |
-| `/r` | 切换文件夹递归 |
-| `/dry` `/ow` | 切换 dry-run / 覆盖同名输出 |
-| `/t <内容>` `/t 1` `/t 2` `/t edit 3` `/t @文件` `/t list` `/t -` | 投毒：填充 / 内置空格 / 内置杂鱼 / 编辑预设 / 模板 / 列预设 / 关 |
-| `/w discord` `/w loli=1011` `/w edit discord` `/w list` `/w -` | 只改词：词表 / 单条 / 改词表 / 列词表 / 关 |
-| `/help` `/q` | 说明 / 退出（Ctrl-D 也行） |
+| `/out DIR` | 输出到指定目录，可以拖入目录作为参数；`/out -` 恢复为输出到源文件所在目录 |
+| `/suffix SUFFIX` | 设置输出文件名后缀 |
+| `/n` | 切换按“日期-序号”重命名 |
+| `/i` | 切换直接修改源文件（不保留原文件） |
+| `/ow` | 切换覆盖已存在的输出文件 |
+| `/t SPEC`、`/t -` | 设置或关闭伪造元数据写入，`SPEC` 的取值与 `-t` 相同 |
+| `/w RULE`、`/w -` | 设置或关闭词语替换，`RULE` 的取值与 `-w` 相同 |
+| `/alpha`、`/icc`、`/scrub` | 切换移除 alpha 通道；切换移除 ICC 色彩配置文件；切换清零所有通道的最低位 |
+| `/r` | 切换递归处理子目录 |
+| `/dry` | 切换试运行 |
+| `/help`、`/q` | 显示帮助；退出（也可以按 Ctrl-D） |
 
-Tab 补全路径，↑↓ 翻历史。`/t` 和 `/w` 互斥，设一个另一个自动关。退出时记住输出目录、后缀、改名、alpha / ICC / 递归这些设置；
-原地覆盖、dry-run、投毒、改词故意不记，每次进来都从安全状态开始。
+- 支持用 Tab 补全路径，用 ↑ ↓ 查看历史输入。
+- `/t` 与 `/w` 互斥，开启其中一个时，另一个自动关闭。
+- 退出时保存以下设置：输出目录、后缀、重命名、alpha、ICC、递归、覆盖。
+- 以下设置不保存，每次启动时均为关闭状态：直接修改源文件、试运行、伪造元数据写入、词语替换。
+
+### 退出码
+
+| 退出码 | 含义 |
+|---|---|
+| 0 | 全部成功。跳过的文件不计为失败 |
+| 1 | 至少有一个文件处理失败或验证未通过；未找到输入文件；参数取值无效；用户取消 |
+| 2 | 命令行参数错误 |
 
 ## 配置文件
 
-| 内容 | 位置（Windows 把 `~/.config` 换成 `%APPDATA%`） |
+配置目录为 `~/.config/nai-meta`。设置了 `XDG_CONFIG_HOME` 时，为 `$XDG_CONFIG_HOME/nai-meta`；Windows 上为 `%APPDATA%\nai-meta`。
+
+| 文件 | 内容 |
 |---|---|
-| TUI 设置 | `~/.config/nai-meta/tui.json` |
-| TUI 历史 | `~/.config/nai-meta/history` |
-| 投毒预设 | `~/.config/nai-meta/presets/<名>.json`（内置 1、2 不在这里，同名文件会盖过它们） |
-| 改词表 | `~/.config/nai-meta/words/<名>.txt` |
-| `:json` 编辑临时文件 | `~/.config/nai-meta/edit.json` |
+| `tui.json` | 交互模式保存的设置 |
+| `history` | 交互模式的输入历史 |
+| `presets/<名称>.json` | 用户预设。内置预设 1、2 不在此目录中 |
+| `words/<名称>.txt` | 用户词表 |
+| `edit.json` | 执行 `:json` 时使用的临时文件 |
 
-## 原理
+## 工作原理
 
-NAI 出图时把同一份元数据写了两遍：
+NovelAI 生成图片时，会把同一份元数据写入两处：
 
-1. **明文层**：PNG 是文本块（tEXt）Title / Description / Software / Source / Generation time / Comment，
-   WebP 是 EXIF（Software = 模型名+哈希，ImageDescription = 提示词，UserComment = 整份 JSON）。
-   Comment 装着全部生成参数。exiftool 能看到，也最容易被转发剥掉。
-2. **LSB 隐写**（stealth pnginfo）：把 Description、Software、Source、Generation time、Comment 这份 JSON gzip 后，
-   按列优先写进 alpha 通道每个像素的最低位。布局 `[magic 15 字节][32 位大端长度][数据][32 位 FEC 长度][FEC]`，
-   magic 是 `stealth_pngcomp`，FEC 长度 `0xffffffff` 表示没有（NAI 目前只写这个标记；用官方 `nai_add_fec.py`
-   加过纠错码的图也认，一并擦）。A1111 插件的 `stealth_pnginfo` 和 RGB 通道的 `stealth_rgbinfo/rgbcomp` 也认。
+1. **明文层**
+   - PNG 写入文本块 Title、Description、Software、Source、Generation time 和 Comment。Comment 为 JSON，包含全部生成参数。
+   - WebP 写入 EXIF：Software 为模型名与哈希，ImageDescription 为提示词，UserComment 为完整元数据的 JSON。
+2. **LSB 隐写层**
+   - 将 Description、Software、Source、Generation time 和 Comment 序列化为 JSON，经 gzip 压缩后，按列优先顺序写入 alpha 通道各像素的最低位。
+   - 布局为 `[magic，15 字节][数据长度，32 位][数据][FEC 长度，32 位][FEC]`，magic 为 `stealth_pngcomp`。
+   - FEC 长度为 `0xffffffff` 时表示没有纠错码，NovelAI 目前只写入这个标记。
+   - 经官方 `nai_add_fec.py` 添加的纠错码也能识别，并一并清除。
+   - 同时支持 A1111 插件使用的 `stealth_pnginfo`，以及 RGB 通道的 `stealth_rgbinfo` 和 `stealth_rgbcomp`。
 
-格式对照官方仓库 [NovelAI/novelai-image-metadata](https://github.com/NovelAI/novelai-image-metadata)；
-读取思路来自 `nai5-prompting/反推/stealth_decode.py`，这里补上了擦除和写入。
+格式定义见官方仓库 [NovelAI/novelai-image-metadata](https://github.com/NovelAI/novelai-image-metadata)。
 
-## 同类项目
+## 限制与注意事项
 
-| 项目 | 读隐写 | 抹隐写 | 备注 |
+- **签名**：NovelAI 会对元数据签名（`signed_hash`）。写入伪造元数据或替换词语后，签名必然失效，因此 nai-meta 会删除该字段，`naii` 显示为无签名。签名无法伪造。
+- **词语替换的范围**：替换基于字符串匹配，例如规则 `loli` 同样会命中 `Lolita`。需要精确匹配时，使用正则表达式。
+- **隐写层的保留条件**：图像经过格式转换、缩放或有损压缩后，隐写层会被破坏。QQ、微信转发通常会移除文本块，但保留隐写层。
+- **NovelAI 的 WebP 格式特点**：
+  - 提示词含中文时，NovelAI 会在 EXIF 的 Description 开头多写 4 个 NUL 字节，隐写层中没有。读取时会去掉这些字节，不计为两层差异。
+  - NovelAI 的 WebP 边缘常有少量 alpha 小于 254 的像素，这些像素保持原值。
+- **非 NovelAI 图片**：A1111、Forge 的 `parameters` 文本、ComfyUI 工作流和相机 JPEG 都可以读取；无法识别的内容按原样列出。
+- **Windows 支持**：已在代码中处理以下差异，但尚未在 Windows 上实测。
+  - cmd 和 PowerShell 不会为外部程序展开 `*.png`，由 nai-meta 自行展开通配符。
+  - 输出重定向到文件时，统一使用 UTF-8 编码。
+  - 传统控制台字体缺少 ✔ ▸ 等符号时，自动改用 √ > !。可用环境变量 `NAI_META_ASCII=1` 或 `0` 强制开启或关闭。
+
+## 相关项目
+
+| 项目 | 读取隐写层 | 清除隐写层 | 说明 |
 |---|---|---|---|
-| [NovelAI/novelai-image-metadata](https://github.com/NovelAI/novelai-image-metadata) | ✓ | ✗ | 官方，读 / 写 / 验签 |
-| [receyuki/stable-diffusion-prompt-reader](https://github.com/receyuki/stable-diffusion-prompt-reader) | ✓ | ✗ | 1.3k★，「清除」实测不碰 LSB |
-| [Takenoko3333/remove-meta-alpha](https://github.com/Takenoko3333/remove-meta-alpha) | ✗ | 删整个 alpha | 2023 年后停更 |
-| [zhulinyv/Semi-Auto-NovelAI-to-Pixiv](https://github.com/zhulinyv/Semi-Auto-NovelAI-to-Pixiv) | ✓ | 用新隐写覆盖 | WebUI，AGPL |
-| [iris-out/naisu](https://github.com/iris-out/naisu) | ✓ | 清 alpha LSB | Chrome 扩展，只管 NAI 站上的下载 |
-| [wiltodelta/remove-ai-watermarks](https://github.com/wiltodelta/remove-ai-watermarks) | ✗ | ✗ | 5.4k★，明确保留 alpha |
+| [NovelAI/novelai-image-metadata](https://github.com/NovelAI/novelai-image-metadata) | ✓ | ✗ | 官方实现，支持读取、写入和验签 |
+| [receyuki/stable-diffusion-prompt-reader](https://github.com/receyuki/stable-diffusion-prompt-reader) | ✓ | ✗ | 其“清除”功能不处理 LSB 隐写 |
+| [Takenoko3333/remove-meta-alpha](https://github.com/Takenoko3333/remove-meta-alpha) | ✗ | 删除整个 alpha 通道 | 2023 年后停止更新 |
+| [zhulinyv/Semi-Auto-NovelAI-to-Pixiv](https://github.com/zhulinyv/Semi-Auto-NovelAI-to-Pixiv) | ✓ | 以新的隐写数据覆盖 | WebUI，AGPL 许可证 |
+| [iris-out/naisu](https://github.com/iris-out/naisu) | ✓ | 清除 alpha 最低位 | Chrome 扩展，仅处理 NovelAI 网站上的下载 |
+| [wiltodelta/remove-ai-watermarks](https://github.com/wiltodelta/remove-ai-watermarks) | ✗ | ✗ | 保留 alpha 通道 |
 
-## 结构
+## 开发
 
-```
-pyproject.toml              依赖 + 命令名
-src/nai_meta/core.py        共用：PNG 块扫描、隐写读 / 擦 / 写、参数整理、改词、跨平台杂项
-src/nai_meta/nai_inspect.py naii
-src/nai_meta/nai_strip.py   nais：剥 / 投毒 / 改词、预设与词表
-src/nai_meta/edit.py        -t edit 与 -w edit 的终端编辑界面
-src/nai_meta/tui.py         nais tui
-src/nai_meta/cli.py         nai 伞形总入口（COMMANDS 表加一行就是新子命令）
-tests/                      合成图往返、格式、解析、投毒与内置预设、改词、改名、TUI、命令行
+```bash
+git clone https://github.com/Miint-Sunny/nai-meta.git
+cd nai-meta
+uv run naii a.png      # 首次运行时自动创建 .venv
+uv run pytest          # 运行测试
 ```
 
-## 实测覆盖
+命令名定义在 `pyproject.toml` 的 `[project.scripts]` 中。修改后，执行 `uv tool install . --reinstall` 生效。
 
-本机 900 多张真图跑过：NovelAI V4 / V4.5 / V5 全部 14 个模型哈希、文生图 / i2i / inpaint / Enhance / 导演工具、
-vibe transfer、角色参考、被转发剥掉文本块只剩隐写的图、A1111 / ComfyUI / 相机 JPEG，零崩溃；剥离后 PNG 像素逐位相同、
-JPEG 扫描数据逐字节相同。NAI 网站的 WebP 下载用两个真样本（纯英文提示词、带中文提示词）验证过读取、比对、剥离、
-投毒和改名，RGB 逐字节相同。Windows 没有真机测试。
+```
+src/nai_meta/core.py         PNG 块扫描、隐写的读取/清除/写入、参数整理、词语替换、跨平台处理
+src/nai_meta/nai_inspect.py  naii
+src/nai_meta/nai_strip.py    nais：移除、伪造元数据写入、词语替换、预设与词表
+src/nai_meta/edit.py         -t edit 与 -w edit 的终端编辑界面
+src/nai_meta/tui.py          nais tui
+src/nai_meta/cli.py          nai 统一入口；新增子命令时，在 COMMANDS 中添加一项
+src/nai_meta/argparse_zh.py  argparse 的中文界面与按显示宽度折行
+tests/                       测试：合成图往返、各格式、解析、伪造元数据与内置预设、词语替换、重命名、交互模式、命令行
+```
 
-## 许可
+已用 900 多张实际生成的图片测试，覆盖以下范围：
 
-MIT。
+- NovelAI V4、V4.5、V5 的全部 14 个模型哈希。
+- 文生图、图生图、局部重绘、增强和导演工具。
+- Vibe Transfer 和角色参考。
+- 文本块已被转发平台移除、只剩隐写层的图片。
+- A1111、ComfyUI 生成的图片和相机拍摄的 JPEG。
+
+测试结果如下：
+
+- 全部图片均读取成功，没有出现错误。
+- 移除元数据后，PNG 的 RGB 像素逐位相同，JPEG 的扫描数据逐字节相同。
+- NovelAI 网站的 WebP 下载用两个样本验证了读取、比对、移除、伪造元数据写入和重命名：一个样本的提示词为纯英文，另一个含中文。
+
+## 许可证
+
+[MIT](LICENSE)

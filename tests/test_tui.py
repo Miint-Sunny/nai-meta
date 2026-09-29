@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""TUI：拖进来的路径解析、文件夹 y/N、设置持久化；命令行文件夹确认。"""
+"""交互模式：拖入路径的解析、目录确认、设置保存；命令行处理目录时的确认。"""
 import json
 import shlex
 
@@ -31,10 +31,10 @@ def test_parse_dragged_paths(tmp_path):
     d = tmp_path / 'my pics'
     d.mkdir()
     (d / 'a b.png').write_bytes(b'')
-    # macOS 拖拽：反斜杠转义空格，多个文件空格隔开
+    # macOS 拖入：空格以反斜杠转义，多个路径以空格分隔
     got = parse_paths(f'{tmp_path}/my\\ pics/a\\ b.png {tmp_path}/my\\ pics')
     assert got == [d / 'a b.png', d]
-    # 手敲的带空格路径，没转义
+    # 手动输入、未转义的含空格路径
     assert parse_paths(str(d / 'a b.png')) == [d / 'a b.png']
     assert parse_paths(f'"{d}"') == [d]
 
@@ -46,12 +46,12 @@ def test_tui_drag_file_and_folder_with_confirm(tmp_path, cfg):
     nai_png(d / 'b.png')
     out = tmp_path / 'out'
     q = shlex.quote
-    # 设输出目录 → 拖单文件 → 拖文件夹并拒绝 → 拖文件夹并同意 → 退出
+    # 设置输出目录，拖入单个文件，拖入目录并拒绝，再次拖入目录并确认，然后退出
     assert drive(f'/out {q(str(out))}\n{q(str(d / "a.png"))}\n{q(str(d))}\nn\n{q(str(d))}\ny\n/q\n') == 0
     assert (out / 'a.png').exists() and (out / 'b.png').exists()
     saved = json.loads((cfg / 'tui.json').read_text('utf-8'))
-    assert saved['outdir'] == str(out) and saved['suffix'] is None      # 没改过后缀就不记，按投毒与否自动选
-    # 再进来时记住了输出目录；/out - 恢复默认后写在原图旁边
+    assert saved['outdir'] == str(out) and saved['suffix'] is None      # 未设置后缀时保存为 None，由是否写入伪造元数据决定默认后缀
+    # 重新启动后保留输出目录；/out - 恢复为输出到源文件所在目录
     nai_png(d / 'c.png')
     assert drive(f'{q(str(d / "c.png"))}\n/out -\n{q(str(d / "c.png"))}\n/q\n') == 0
     assert (out / 'c.png').exists() and (d / 'c_clean.png').exists()
@@ -61,7 +61,7 @@ def test_tui_folder_declined_writes_nothing(tmp_path, cfg):
     d = tmp_path / 'pics'
     d.mkdir()
     nai_png(d / 'a.png')
-    assert drive(f'{shlex.quote(str(d))}\n\n/q\n') == 0        # 直接回车 = 否
+    assert drive(f'{shlex.quote(str(d))}\n\n/q\n') == 0        # 直接按回车视为拒绝
     assert not (d / 'a_clean.png').exists()
 
 
@@ -76,7 +76,7 @@ def test_cli_folder_asks_and_respects_answer(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr('builtins.input', lambda _prompt: 'y')
     assert strip_main([str(d)]) == 0
     assert (d / 'a_clean.png').exists()
-    # -y 不问；逐个点名的文件也不问
+    # 使用 -y 或逐个指定文件时不请求确认
     nai_png(d / 'b.png')
     monkeypatch.setattr('builtins.input', lambda _prompt: pytest.fail('不该问'))
     assert strip_main([str(d), '-y', '--overwrite']) == 0
@@ -84,7 +84,7 @@ def test_cli_folder_asks_and_respects_answer(tmp_path, monkeypatch, capsys):
 
 
 def test_absolute_path_without_spaces_is_not_a_command(tmp_path, cfg):
-    """macOS 拖进来的路径是 /Users/... 开头，之前被当成命令吞掉了。"""
+    """以 / 开头的绝对路径（如 macOS 的 /Users/...）不能被识别为命令。"""
     src = tmp_path / 'a.png'
     nai_png(src)
     assert ' ' not in str(src)

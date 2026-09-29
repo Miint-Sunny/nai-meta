@@ -15,7 +15,7 @@ from nai_meta.nai_strip import webp_chunks
 def _stealth_rgba(transparent=False):
     arr = random_rgba()
     if transparent:
-        arr[-10:, -10:, 3] = 0            # 右下角，避开隐写占用的前几列
+        arr[-10:, -10:, 3] = 0            # 位于右下角，避开隐写数据占用的前几列
     embed(arr, 'alpha', 'stealth_pngcomp', gzip.compress(json.dumps(META).encode()))
     return arr
 
@@ -46,13 +46,13 @@ def test_webp_lossy_opaque_alpha_container_strip(tmp_path):
     tags_in = [t for t, _ in webp_chunks(raw)]
     assert b'ALPH' in tags_in and b'EXIF' in tags_in
     with Image.open(src) as im:
-        assert find_stealth(im)                   # 有损 WebP 的 alpha 是无损压缩的，隐写还在
+        assert find_stealth(im)                   # 有损 WebP 的 alpha 为无损压缩，隐写数据保留
     assert strip_main([str(src)]) == 0
     dst = tmp_path / 'a_clean.webp'
     assert_clean(dst)
     chunks_out = webp_chunks(dst.read_bytes())
-    assert [t for t, _ in chunks_out] == [b'VP8 ']                 # 退回简单格式，只剩图像数据
-    assert dict(chunks_out)[b'VP8 '] == dict(webp_chunks(raw))[b'VP8 ']   # RGB 数据一字节不动
+    assert [t for t, _ in chunks_out] == [b'VP8 ']                 # 改为简单格式，仅保留图像数据
+    assert dict(chunks_out)[b'VP8 '] == dict(webp_chunks(raw))[b'VP8 ']   # RGB 数据逐字节不变
     with Image.open(dst) as im:
         assert im.mode == 'RGB'
 
@@ -61,7 +61,7 @@ def test_webp_lossy_transparent_reencodes_with_note(tmp_path, capsys):
     src = tmp_path / 'a.webp'
     Image.fromarray(_stealth_rgba(transparent=True)).save(src, quality=80, exif=_exif())
     assert strip_main([str(src)]) == 0
-    assert '真透明' in capsys.readouterr().out
+    assert '含透明像素' in capsys.readouterr().out
     dst = tmp_path / 'a_clean.webp'
     assert_clean(dst)
     out = np.asarray(Image.open(dst).convert('RGBA'))
@@ -69,7 +69,7 @@ def test_webp_lossy_transparent_reencodes_with_note(tmp_path, capsys):
 
 
 def _official_layout(arr, payload, fec=None):
-    """官方格式：magic + 32 位载荷比特数 + 载荷 + 32 位 FEC 比特数（0xffffffff = 无）+ FEC。"""
+    """按官方格式写入：magic、32 位数据长度（比特）、数据、32 位 FEC 长度（0xffffffff 表示无）、FEC。"""
     data = b'stealth_pngcomp' + (len(payload) * 8).to_bytes(4, 'big') + payload
     data += (len(fec) * 8).to_bytes(4, 'big') + fec if fec else b'\xff\xff\xff\xff'
     bits = np.unpackbits(np.frombuffer(data, dtype=np.uint8))
@@ -92,7 +92,7 @@ def test_fec_data_detected_and_wiped(tmp_path):
     arr = random_rgba()
     fec = b'\xab' * 40
     n = _official_layout(arr, gzip.compress(json.dumps(META).encode()), fec)
-    arr[-10:, -10:, 3] = 0                    # 加点真透明：不是全不透明也得把占用区擦干净
+    arr[-10:, -10:, 3] = 0                    # 加入透明像素：图像并非完全不透明时，隐写区域同样须被清除
     src = tmp_path / 'a.png'
     Image.fromarray(arr).save(src)
     with Image.open(src) as im:
@@ -103,33 +103,36 @@ def test_fec_data_detected_and_wiped(tmp_path):
     assert_clean(dst)
     out = np.asarray(Image.open(dst))
     col_major = out[..., 3].T.reshape(-1)
-    assert (col_major[:n] == 0xFF).all()      # 头 + 载荷 + FEC 段：254/255 一律归回 255
-    assert (out[-10:, -10:, 3] == 0).all()    # 真透明不动
+    assert (col_major[:n] == 0xFF).all()      # 头部、数据与 FEC 段中的 254、255 均恢复为 255
+    assert (out[-10:, -10:, 3] == 0).all()    # 透明像素保持原值
 
 
 def test_stealth_area_back_to_255_despite_odd_edge_pixels(tmp_path):
-    """真实 NAI WebP：底边有几个 alpha 239 / 251 的像素，整张不算全不透明。
-    以前因此只清最低位，留下一条 254 的带子（等于告诉别人这里擦过隐写）；现在占用区归回 255，别处一位不碰。"""
+    """隐写区域的 alpha 恢复为 255，不受区域外非不透明像素的影响。
+
+    NovelAI 的 WebP 边缘常有少量 alpha 为 239、251 的像素，整幅图像因此不属于完全不透明。
+    隐写区域须恢复为 255，否则会留下一段 alpha 为 254 的区域，表明隐写数据曾被清除；区域外的像素保持原值。
+    """
     arr = random_rgba()
     arr[..., 3] = 255
     embed(arr, 'alpha', 'stealth_pngcomp', gzip.compress(json.dumps(META).encode()))
     h, w = arr.shape[:2]
-    arr[h - 1, w - 1, 3], arr[h - 2, w // 2, 3], arr[1, 0, 3] = 239, 251, 239   # 最后一个落在占用区里
+    arr[h - 1, w - 1, 3], arr[h - 2, w // 2, 3], arr[1, 0, 3] = 239, 251, 239   # 最后一个像素位于隐写区域内
     src = tmp_path / 'a.webp'
     Image.fromarray(arr).save(src, lossless=True)
     assert strip_main([str(src)]) == 0
     out = np.asarray(Image.open(tmp_path / 'a_clean.webp').convert('RGBA'))
     assert np.array_equal(out[..., :3], arr[..., :3])
     a = out[..., 3].copy()
-    assert a[h - 1, w - 1] == 239 and a[h - 2, w // 2] == 251 and a[1, 0] == 238   # 占用区里的只清最低位
+    assert a[h - 1, w - 1] == 239 and a[h - 2, w // 2] == 251 and a[1, 0] == 238   # 隐写区域内 alpha < 254 的像素只清除最低位
     a[h - 1, w - 1] = a[h - 2, w // 2] = a[1, 0] = 255
-    assert (a == 255).all()                   # 其余全是 255，没有 254 的带子
+    assert (a == 255).all()                   # 其余像素均为 255
 
 
 def _nai_style_exif():
-    """NAI 的 WebP 下载：EXIF Software = 模型名+哈希，DocumentName = Title，ImageDescription = 提示词，UserComment = {"Comment": ...}"""
+    """构造 NovelAI WebP 下载的 EXIF：Software 为模型名与哈希，DocumentName 为 Title，ImageDescription 为提示词，UserComment 为 JSON。"""
     ex = Image.Exif()
-    ex[0x0131] = META['Source']                 # NAI 把模型名+哈希写在 Software 里
+    ex[0x0131] = META['Source']                 # NovelAI 将模型名与哈希写入 Software
     ex[0x010d] = 'NovelAI generated image'
     ex[0x010e] = META['Description']
     ex.get_ifd(0x8769)[0x9286] = b'ASCII\x00\x00\x00' + json.dumps({'Comment': META['Comment']}).encode()
@@ -143,7 +146,7 @@ def test_nai_webp_download_layout(tmp_path):
     Image.fromarray(arr).save(src, lossless=True, exif=_nai_style_exif())
     rec = inspect_file(src)
     assert rec['text_meta'] is None and rec['stealth'] and rec['outer_layer'] == 'EXIF'
-    assert rec['consistent'] is True                                # EXIF 层 vs 隐写层
+    assert rec['consistent'] is True                                # 比对 EXIF 与隐写层
     meta, src_name = choose_meta(rec, 'auto')
     assert src_name == 'EXIF'
     s = summarize(meta)
@@ -157,8 +160,11 @@ def test_nai_webp_download_layout(tmp_path):
 
 
 def test_nai_webp_description_leading_nuls(tmp_path):
-    """真实 NAI WebP：提示词带中文时 Description 前面多 4 个 NUL（ImageDescription 和 UserComment 的整份 JSON 里都有），
-    不能算两层不一致，也不能带进 -p 输出。"""
+    """Description 开头的 NUL 字节不计为两层差异。
+
+    提示词含中文时，NovelAI 的 WebP 在 ImageDescription 与 UserComment 内 Description 的开头写入 4 个 NUL，
+    隐写层中没有。读取时须去掉 NUL，既不报告两层不一致，也不出现在 -p 的输出中。
+    """
     from nai_meta.nai_inspect import inspect_file
     src = tmp_path / 'nai.webp'
     nul = '\x00\x00\x00\x00' + META['Description']
@@ -168,6 +174,6 @@ def test_nai_webp_description_leading_nuls(tmp_path):
     ex[0x010e] = nul
     ex.get_ifd(0x8769)[0x9286] = b'ASCII\x00\x00\x00' + json.dumps({**META, 'Description': nul}).encode()
     Image.fromarray(_stealth_rgba()).save(src, lossless=True, exif=ex.tobytes())
-    assert b'\x00\x00\x00\x00' + META['Description'].encode() in src.read_bytes()   # 确实写进去了
+    assert b'\x00\x00\x00\x00' + META['Description'].encode() in src.read_bytes()   # 确认测试数据包含 NUL
     rec = inspect_file(src)
     assert rec['exif_meta']['Description'] == META['Description'] and rec['consistent'] is True

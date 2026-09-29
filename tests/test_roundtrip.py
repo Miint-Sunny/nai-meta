@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""合成带隐写 / 文本块 / EXIF 的小图，nai-inspect 得读出来，nai-strip 得剥干净且像素不变。"""
+"""用含隐写数据、文本块和 EXIF 的合成图像测试：nai-inspect 能完整读取，nai-strip 能全部移除且像素不变。"""
 import gzip
 import json
 
@@ -22,7 +22,7 @@ META = {'Description': '1girl, solo', 'Software': 'NovelAI', 'Source': 'NovelAI 
 
 
 def embed(arr, channel, magic, data):
-    """把 magic + 32 位长度 + data 按列优先写进最低位（与 NAI 写入顺序一致）。"""
+    """将 magic、32 位长度与 data 按列优先顺序写入最低位，与 NovelAI 的写入顺序一致。"""
     head = magic.encode() + (len(data) * 8).to_bytes(4, 'big') + data
     bits = np.unpackbits(np.frombuffer(head, dtype=np.uint8))
     h = arr.shape[0]
@@ -115,13 +115,13 @@ def test_strip_removes_everything_keeps_pixels(tmp_path, channel, compressed, tr
     assert_clean(dst)
     after = np.asarray(Image.open(dst))
     if channel == 'alpha':
-        assert np.array_equal(before[..., :3], after[..., :3])      # RGB 一位不差
+        assert np.array_equal(before[..., :3], after[..., :3])      # RGB 逐位相同
         if transparent:
-            assert (after[:10, :10, 3] == 0).all()                    # 真透明保留
+            assert (after[:10, :10, 3] == 0).all()                    # 透明像素保留
         else:
-            assert (after[..., 3] == 255).all()                       # 归回全不透明
+            assert (after[..., 3] == 255).all()                       # 恢复为完全不透明
     else:
-        assert np.abs(before.astype(int) - after.astype(int)).max() <= 1   # 隐写就在 RGB 最低位，只能差 1
+        assert np.abs(before.astype(int) - after.astype(int)).max() <= 1   # 隐写数据位于 RGB 最低位，差值不超过 1
 
 
 def test_strip_rgb_stealth_only_touches_lsb(tmp_path):
@@ -145,7 +145,7 @@ def test_strip_jpeg_lossless(tmp_path):
     assert strip_main([str(src), '-i']) == 0
     out = src.read_bytes()
     assert_clean(src)
-    assert out[out.index(b'\xff\xda'):] == raw[raw.index(b'\xff\xda'):]   # 扫描数据原样
+    assert out[out.index(b'\xff\xda'):] == raw[raw.index(b'\xff\xda'):]   # 扫描数据不变
 
 
 def test_strip_in_place_skips_clean_file(tmp_path, capsys):
@@ -154,12 +154,12 @@ def test_strip_in_place_skips_clean_file(tmp_path, capsys):
     raw = p.read_bytes()
     assert strip_main([str(p), '-i']) == 0
     assert p.read_bytes() == raw
-    assert '不动' in capsys.readouterr().out
+    assert '未检测到元数据' in capsys.readouterr().out
 
 
 def test_no_overwrite_by_default(tmp_path):
     src = tmp_path / 'a.png'
     nai_png(src)
     assert strip_main([str(src)]) == 0
-    assert strip_main([str(src)]) == 1            # a_clean.png 已存在 → 跳过并返回 1
+    assert strip_main([str(src)]) == 0            # a_clean.png 已存在：跳过，跳过不计为失败
     assert strip_main([str(src), '--overwrite']) == 0

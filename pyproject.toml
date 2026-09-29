@@ -1,7 +1,7 @@
 [project]
 name = "nai-meta"
 version = "0.1.0"
-description = "NovelAI 图片元数据小工具：读取 / 剥离 PNG 文本块与 LSB 隐写"
+description = "读取、移除和改写 NovelAI 生成图片中的元数据（PNG 文本块、EXIF 与 LSB 隐写），不修改像素数据"
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
@@ -14,7 +14,7 @@ dependencies = [
 ]
 
 [project.scripts]
-nai = "nai_meta.cli:main"                     # nai i / nai s
+nai = "nai_meta.cli:main"                     # 子命令形式：nai i、nai s
 naii = "nai_meta.nai_inspect:main"
 nais = "nai_meta.nai_strip:main"
 nai-inspect = "nai_meta.nai_inspect:main"

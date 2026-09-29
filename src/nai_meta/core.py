@@ -1,21 +1,21 @@
 # -*- coding: utf-8 -*-
-"""nai-meta 共用逻辑：PNG 块扫描、LSB 隐写读/擦、NAI 元数据整理。
+"""nai-meta 的共用逻辑：PNG 块扫描、LSB 隐写的读取/清除/写入、NovelAI 元数据整理。
 
-NAI 出图时把同一份元数据写了两遍：
+NovelAI 生成的图片包含两层相同的元数据：
 
-1. PNG 文本块（tEXt）：Title / Description / Software / Source / Generation time / Comment。
-   Comment 是 JSON 字符串，装着全部生成参数（prompt、uc、seed、sampler、v4_prompt …）。
-   这一层 exiftool 能看到，也最容易被 QQ/微信转发剥掉。
-2. LSB 隐写（stealth pnginfo）：把 {Description, Software, Source, Generation time, Comment}
-   这份 JSON gzip 后，按**列优先**顺序写进 alpha 通道每个像素的最低位。
-   novelai.net/inspect 读的就是它；只要图没被重编码（转 JPEG、缩放、二压）就还在。
+1. 明文层。PNG 使用文本块（tEXt）：Title、Description、Software、Source、Generation time、Comment；
+   WebP 使用 EXIF。Comment 为 JSON 字符串，包含全部生成参数（prompt、uc、seed、sampler、v4_prompt 等）。
+   该层可被 exiftool 等通用工具读取，也最容易被转发平台移除。
+2. LSB 隐写层（stealth pnginfo）。将 {Description, Software, Source, Generation time, Comment}
+   序列化为 JSON 并以 gzip 压缩，按列优先顺序写入 alpha 通道各像素的最低位。
+   novelai.net/inspect 读取的是该层；图像未经重新编码（转换格式、缩放、有损压缩）时该层保持完整。
 
-   比特流布局：[magic 15 字节 ASCII][32 位大端 = 数据比特数][数据]
-   magic：stealth_pnginfo / stealth_pngcomp（alpha 通道，后者 gzip）
-         stealth_rgbinfo / stealth_rgbcomp（无 alpha 时写 RGB 三通道，A1111 插件用）
-   NAI 自己只写 stealth_pngcomp。
+   比特流布局：[magic，15 字节 ASCII][数据长度，32 位大端，单位为比特][数据][FEC 长度，32 位]
+   magic：stealth_pnginfo / stealth_pngcomp（alpha 通道，后者经 gzip 压缩）；
+          stealth_rgbinfo / stealth_rgbcomp（RGB 三通道，A1111 插件在无 alpha 时使用）。
+   NovelAI 仅写入 stealth_pngcomp。
 
-读取思路来自 nai5-prompting/反推/stealth_decode.py，这里补上了「擦除」这一半。
+格式定义见 https://github.com/NovelAI/novelai-image-metadata 。
 """
 from __future__ import annotations
 
@@ -44,7 +44,7 @@ IMG_EXTS = {'.png', '.jpg', '.jpeg', '.webp'}
 # ---------------------------------------------------------------- PNG 块
 PNG_SIG = b'\x89PNG\r\n\x1a\n'
 TEXT_TYPES = (b'tEXt', b'iTXt', b'zTXt')
-# 这些块会被 nai-strip 去掉：文本、EXIF、修改时间
+# nai-strip 移除的 PNG 块：文本、EXIF、修改时间
 META_TYPES = TEXT_TYPES + (b'eXIf', b'tIME')
 COLOR_TYPES = {0: 'Gray', 2: 'RGB', 3: 'Palette', 4: 'Gray+Alpha', 6: 'RGBA'}
 
@@ -57,7 +57,7 @@ class PngScan:
     color_type: int = 0
     interlace: int = 0
     texts: dict = field(default_factory=dict)      # 关键字 → 文本
-    exif: bytes | None = None                      # eXIf 块原始内容
+    exif: bytes | None = None                      # eXIf 块的原始字节
     chunks: Counter = field(default_factory=Counter)
 
     @property
@@ -66,7 +66,7 @@ class PngScan:
 
 
 def _txt(b: bytes) -> str:
-    """PNG 规范说 tEXt 是 Latin-1，但 NAI 和大多数工具实际写的是 UTF-8。"""
+    """解码文本块内容。PNG 规范规定 tEXt 为 Latin-1，NovelAI 与多数工具实际写入 UTF-8，故优先按 UTF-8 解码。"""
     try:
         return b.decode('utf-8')
     except UnicodeDecodeError:
@@ -79,20 +79,24 @@ def _decode_text_chunk(typ: bytes, data: bytes) -> tuple[str, str]:
     try:
         if typ == b'tEXt':
             return key, _txt(rest)
-        if typ == b'zTXt':                       # 1 字节压缩方法 + zlib 流
+        if typ == b'zTXt':                       # 1 字节压缩方法，其后为 zlib 数据流
             return key, _txt(zlib.decompress(rest[1:]))
-        flag, rest = rest[0], rest[2:]           # iTXt: 压缩标志、压缩方法、语言、翻译关键字、正文
+        flag, rest = rest[0], rest[2:]           # iTXt：压缩标志、压缩方法、语言标签、翻译后的关键字、正文
         _lang, _, rest = rest.partition(b'\x00')
         _trans, _, text = rest.partition(b'\x00')
         if flag == 1:
             text = zlib.decompress(text)
         return key, _txt(text)
-    except Exception as e:                       # 坏块不该让整张图读不了
-        return key, f'<无法解码: {e}>'
+    except Exception as e:                       # 单个损坏的块不影响读取其余内容
+        return key, f'<无法解码：{e}>'
 
 
 def scan_png(path) -> PngScan | None:
-    """逐块扫描 PNG，只读文本 / eXIf / IHDR，IDAT 直接跳过。非 PNG 返回 None。"""
+    """逐块扫描 PNG 文件，读取 IHDR、文本块和 eXIf，跳过图像数据。
+
+    Returns:
+        扫描结果；文件不是 PNG 时返回 None。
+    """
     with open(path, 'rb') as fh:
         if fh.read(8) != PNG_SIG:
             return None
@@ -110,7 +114,7 @@ def scan_png(path) -> PngScan | None:
                  _c, _f, scan.interlace) = struct.unpack('>IIBBBBB', d[:13])
             elif typ in TEXT_TYPES:
                 k, v = _decode_text_chunk(typ, fh.read(ln))
-                if k in scan.texts:              # 同名块重复时加序号，不覆盖
+                if k in scan.texts:              # 关键字重复时追加序号，保留全部内容
                     k = f'{k}#{scan.chunks[name]}'
                 scan.texts[k] = v
             elif typ == b'eXIf':
@@ -125,7 +129,7 @@ def scan_png(path) -> PngScan | None:
 
 # ---------------------------------------------------------------- 元数据整理
 def expand_comment(meta: dict) -> dict:
-    """Comment 字段本身是 JSON 字符串，展开成 dict 方便取值。就地修改并返回。"""
+    """将 Comment 字段从 JSON 字符串解析为 dict。就地修改 meta 并返回；无法解析时保持原样。"""
     c = meta.get('Comment')
     if isinstance(c, str):
         try:
@@ -138,6 +142,7 @@ def expand_comment(meta: dict) -> dict:
 
 
 def is_nai(meta: dict | None) -> bool:
+    """判断 meta 是否为 NovelAI 元数据。"""
     if not meta:
         return False
     if 'NovelAI' in str(meta.get('Software', '')) or 'NovelAI' in str(meta.get('Source', '')):
@@ -147,7 +152,10 @@ def is_nai(meta: dict | None) -> bool:
 
 
 def meta_from_text(s: str) -> dict | None:
-    """一段字符串（隐写正文 / EXIF UserComment / JPEG 注释）里解出 NAI 元数据。"""
+    """从字符串（隐写正文、EXIF UserComment、JPEG 注释）中解析 NovelAI 元数据。
+
+    也接受 A1111 格式的 parameters 文本。无法解析时返回 None。
+    """
     try:
         d = json.loads(s)
     except (json.JSONDecodeError, TypeError):
@@ -156,12 +164,12 @@ def meta_from_text(s: str) -> dict | None:
         return None
     if 'Comment' in d:
         return expand_comment(d)
-    if 'prompt' in d:                            # 有人只把 Comment 那层塞进来
+    if 'prompt' in d:                            # 仅包含 Comment 内层对象的情况
         return {'Comment': d}
     return None
 
 
-# 采样器 id → NAI 界面上的名字
+# 采样器标识 → NovelAI 界面显示名
 SAMPLERS = {
     'k_euler': 'Euler', 'k_euler_ancestral': 'Euler Ancestral',
     'k_dpmpp_2s_ancestral': 'DPM++ 2S Ancestral', 'k_dpmpp_2m': 'DPM++ 2M',
@@ -178,8 +186,8 @@ REQUEST_TYPES = {
     'A1111-img2img': ('a1111_img2img', 'WebUI 图生图（A1111 格式）'),
 }
 STRENGTH_KINDS = ('img2img', 'inpaint', 'enhance', 'a1111_img2img')
-# 模型哈希 → 名字。Source 缺失或写成枚举名（见过 "DiffusionModelMetaName.NAIv4next"）时兜底；
-# 除 V3 外都是从本机 900 多张图里统计出来的
+# 模型哈希 → 模型名。用于 Source 缺失或为内部枚举名（如 "DiffusionModelMetaName.NAIv4next"）的情况。
+# V3 以外的条目统计自实际生成的图片。
 KNOWN_MODEL_HASHES = {
     'C1E1DE52': 'NovelAI Diffusion V3',
     'F6E18726': 'NovelAI Diffusion V4', '79F47848': 'NovelAI Diffusion V4', '4F49EC75': 'NovelAI Diffusion V4',
@@ -193,11 +201,17 @@ _A1111_KV = re.compile(r'\s*([A-Za-z][\w ]*?):\s*("(?:[^"\\]|\\.)*"|[^,]*)(?:,|$
 
 
 def parse_a1111(text: str) -> dict | None:
-    """Stable Diffusion WebUI（A1111 / Forge，很多工具沿用）的 parameters 文本 → 伪 NAI 元数据，
-    好让摘要和版式复用。格式：
+    """将 Stable Diffusion WebUI（A1111、Forge 等）的 parameters 文本转换为 NovelAI 元数据结构。
+
+    转换后可复用同一套摘要与显示逻辑。输入格式::
+
         正向提示词
-        Negative prompt: 负面
-        Steps: 28, Sampler: Euler a, CFG scale: 7, Seed: 1, Size: 512x768, Model hash: abc, Model: xyz"""
+        Negative prompt: 负面提示词
+        Steps: 28, Sampler: Euler a, CFG scale: 7, Seed: 1, Size: 512x768, Model hash: abc, Model: xyz
+
+    Returns:
+        元数据 dict；文本不是该格式时返回 None。
+    """
     if not text or 'Steps:' not in text:
         return None
     lines = text.strip().split('\n')
@@ -232,6 +246,7 @@ def parse_a1111(text: str) -> dict | None:
 
 
 def num(v) -> str:
+    """格式化数值：浮点数去掉多余的零。"""
     return f'{v:g}' if isinstance(v, float) else str(v)
 
 
@@ -240,7 +255,10 @@ def _nums(xs) -> str:
 
 
 def _chars(cp: dict) -> list[dict]:
-    """角色 caption 列表。空的跳过但保留原序号：负面区块的「角色 2」得对应正向的「角色 2」。"""
+    """提取角色提示词列表。
+
+    跳过空的角色提示词，但保留原始序号，使负面提示词中的“角色 2”与正向提示词中的“角色 2”对应。
+    """
     out = []
     for i, cc in enumerate(cp.get('char_captions') or [], 1):
         t = (cc.get('char_caption') or '').strip()
@@ -251,13 +269,16 @@ def _chars(cp: dict) -> list[dict]:
 
 
 def summarize(meta: dict) -> dict:
-    """摊平成一眼能看的参数表：模型 / 生图类型 / 附加功能 / 采样 / 引导 / 各区块提示词 / 开关。"""
+    """将元数据整理为扁平的参数摘要。
+
+    包括模型、生成类型、附加功能、采样、引导、各部分提示词和已启用的开关。
+    """
     c = meta.get('Comment') if isinstance(meta.get('Comment'), dict) else {}
     v4 = c.get('v4_prompt') or {}
     cap = v4.get('caption') or {}
     ncap = (c.get('v4_negative_prompt') or {}).get('caption') or {}
 
-    # 模型：Source 形如 "NovelAI Diffusion V5 0ADF9AB7"，末尾 8 位十六进制是模型哈希
+    # 模型：Source 形如 "NovelAI Diffusion V5 0ADF9AB7"，末尾 8 位十六进制数为模型哈希
     source = str(meta.get('Source') or '')
     m = _HASH_RE.search(source)
     mhash = c.get('model_hash') or (m.group(1) if m else None)
@@ -266,8 +287,8 @@ def summarize(meta: dict) -> dict:
         mname = KNOWN_MODEL_HASHES.get(mhash.upper(), mname)
     model = {'name': mname, 'hash': mhash, 'source': source or None, 'software': meta.get('Software')}
 
-    # 生图类型：request_type 分文生图 / i2i / inpaint；Enhance 是带 upscaled_enhance 的 i2i；
-    # Director Tools（emotion / lineart / colorize …）走 req_type + defry
+    # 生成类型：request_type 区分文生图、图生图和局部重绘；Enhance 是带 upscaled_enhance 的图生图；
+    # 导演工具（emotion、lineart、colorize 等）由 req_type 与 defry 标识
     rt = c.get('request_type')
     kind, label = REQUEST_TYPES.get(rt, (rt or 'unknown', rt or '未知'))
     gtype = {'kind': kind, 'label': label, 'request_type': rt}
@@ -278,13 +299,13 @@ def summarize(meta: dict) -> dict:
     elif c.get('upscaled_enhance'):
         gtype.update(kind='enhance', label='增强 Enhance')
     if gtype['kind'] in STRENGTH_KINDS:
-        sub = c.get('img2img') if isinstance(c.get('img2img'), dict) else {}   # V4.5 inpaint 把这些塞在子字典里
+        sub = c.get('img2img') if isinstance(c.get('img2img'), dict) else {}   # V4.5 局部重绘将这些字段放在子对象中
         for k in ('strength', 'noise'):
             v = c[k] if c.get(k) is not None else sub.get(k)
             if v is not None:
                 gtype[k] = v
 
-    # 附加功能：Vibe Transfer / 角色参考 / ControlNet，任何类型都可能叠加
+    # 附加功能：Vibe Transfer、角色参考、ControlNet，可与任意生成类型组合
     addons = []
     refs = c.get('reference_strength_multiple') or (
         [c['reference_strength']] if c.get('reference_strength') is not None else [])
@@ -302,7 +323,7 @@ def summarize(meta: dict) -> dict:
         addons.append({'kind': 'controlnet', 'label': f"ControlNet {c['controlnet_model']}",
                        'detail': f"强度 {num(c['controlnet_strength'])}" if c.get('controlnet_strength') is not None else ''})
 
-    # 开关：只列打开的
+    # 开关：仅列出已启用的项
     toggles: dict = {}
     if c.get('skip_cfg_above_sigma') not in (None, 0, False):
         toggles['Variety+'] = True
@@ -348,7 +369,10 @@ def summarize(meta: dict) -> dict:
 
 
 def diff_meta(a: dict, b: dict) -> list[str]:
-    """两份 NAI 元数据哪些字段不一样。只比公共字段（文本块多一个 Title，隐写里没有）。"""
+    """比较两份 NovelAI 元数据，返回取值不同的字段名。
+
+    仅比较两层共有的字段（明文层的 Title 在隐写层中不存在）。
+    """
     out = []
     for k in ('Description', 'Software', 'Source', 'Generation time'):
         if k in a and k in b and a[k] != b[k]:
@@ -357,7 +381,7 @@ def diff_meta(a: dict, b: dict) -> list[str]:
     if isinstance(ca, dict) and isinstance(cb, dict):
         for k in sorted(set(ca) | set(cb)):
             va, vb = ca.get(k), cb.get(k)
-            # 两层各自签名，signed_hash 本来就不同；隐写层不存参考图这类大字段（写成 None），一边缺失不算冲突
+            # 两层分别签名，signed_hash 必然不同；隐写层不保存参考图等大字段（值为 None），单侧缺失不视为差异
             if k == 'signed_hash' or va is None or vb is None:
                 continue
             if va != vb:
@@ -374,7 +398,7 @@ MAGICS = {
     'stealth_rgbinfo': ('rgb', False),
     'stealth_rgbcomp': ('rgb', True),
 }
-SIG_BITS = 15 * 8           # 四种 magic 等长
+SIG_BITS = 15 * 8           # 四种 magic 长度相同
 LEN_BITS = 32
 HEADER_BITS = SIG_BITS + LEN_BITS
 
@@ -384,25 +408,26 @@ class Stealth:
     channel: str            # 'alpha' | 'rgb'
     compressed: bool
     magic: str
-    used_bits: int          # 头 + 数据 (+ FEC 段) 一共占了多少个最低位（擦除时用）
+    used_bits: int          # 头部、数据与 FEC 段共占用的最低位数量，清除时使用
     nbytes: int             # 解压后的字节数
     text: str
-    fec_bytes: int = 0      # 官方格式载荷后可选的纠错码，NAI 目前不写
+    fec_bytes: int = 0      # 官方格式数据之后可选的纠错码长度；NovelAI 目前不写入
 
     @property
     def meta(self) -> dict | None:
         return meta_from_text(self.text)
 
     def describe(self) -> str:
+        """返回简短描述，如 ``alpha+gzip 4726 B``。"""
         s = f"{self.channel}{'+gzip' if self.compressed else ''} {self.nbytes} B"
         return s + (f' + FEC {self.fec_bytes} B' if self.fec_bytes else '')
 
 
 def _lsb_stream(arr: np.ndarray, channel: str) -> np.ndarray:
-    """把最低位抽成 0/1 比特流。列优先：先走完一列的 y，再下一列 x，与写入顺序一致。"""
+    """提取最低位比特流。按列优先顺序（先遍历一列的所有行，再到下一列），与写入顺序一致。"""
     if channel == 'alpha':
         return (arr[:, :, 3] & 1).T.reshape(-1)
-    # 每个像素贡献 r,g,b 三位，像素本身按列优先
+    # RGB 模式下每个像素依次提供 R、G、B 三个比特，像素按列优先排列
     return (arr[:, :, :3] & 1).transpose(1, 0, 2).reshape(-1)
 
 
@@ -414,7 +439,13 @@ def _to_rgb_or_rgba(im: Image.Image) -> Image.Image:
 
 
 def find_stealth(im: Image.Image) -> Stealth | None:
-    """在图里找隐写。RGBA 先查 alpha 通道再查 RGB；RGB 只查 RGB。找不到返回 None。"""
+    """检测图像中的 LSB 隐写数据。
+
+    RGBA 图像依次检查 alpha 通道与 RGB 通道，RGB 图像仅检查 RGB 通道。
+
+    Returns:
+        检测结果；未检测到时返回 None。
+    """
     im = _to_rgb_or_rgba(im)
     arr = np.asarray(im)
     channels = ('alpha', 'rgb') if im.mode == 'RGBA' else ('rgb',)
@@ -434,18 +465,18 @@ def _decode_channel(arr: np.ndarray, channel: str) -> Stealth | None:
         return None
     compressed = MAGICS[magic][1]
     n_bits = int.from_bytes(np.packbits(bits[SIG_BITS:HEADER_BITS]).tobytes(), 'big')
-    # 长度得字节对齐、为正、装得下，否则判为噪声误命中
+    # 长度须为正数、按字节对齐且不超出图像容量，否则视为噪声误匹配
     if n_bits <= 0 or n_bits % 8 or HEADER_BITS + n_bits > bits.size:
         return None
     payload = np.packbits(bits[HEADER_BITS:HEADER_BITS + n_bits]).tobytes()
     if compressed:
         try:
             payload = gzip.decompress(payload)
-        except Exception:                        # gzip 头对上了但内容坏了
+        except Exception:                        # magic 匹配但数据已损坏
             return None
     used, fec_bytes = HEADER_BITS + n_bits, 0
-    # 官方格式（alpha 通道）载荷后还跟一段可选 FEC 纠错码：32 位长度（比特数），0xffffffff = 没有。
-    # NAI 目前只写这个标记；用官方 nai_add_fec.py 加过 FEC 的图这里也一并算进擦除范围。
+    # 官方格式（alpha 通道）在数据之后有一段可选的 FEC 纠错码：先是 32 位长度（单位为比特），
+    # 0xffffffff 表示无纠错码。NovelAI 目前只写入该标记；经官方 nai_add_fec.py 添加的纠错码同样计入清除范围。
     if channel == 'alpha' and used + LEN_BITS <= bits.size:
         fec_len = int.from_bytes(np.packbits(bits[used:used + LEN_BITS]).tobytes(), 'big')
         if fec_len == 0xFFFFFFFF:
@@ -457,9 +488,15 @@ def _decode_channel(arr: np.ndarray, channel: str) -> Stealth | None:
 
 
 def wipe_stealth(arr: np.ndarray, channel: str, used_bits: int) -> int:
-    """就地擦掉隐写占用的那些最低位。只动头 + 数据覆盖到的像素，其余一位不碰。
-    alpha 隐写：占用区里 ≥254 的归回 255（NAI 是在不透明的 alpha 上改最低位，254 只可能是它写的），
-    其余清最低位。整张图有几个非 255 的边缘像素（NAI 的 WebP 常见）也不影响。返回归回 255 的像素数。"""
+    """就地清除隐写数据占用的最低位，不修改占用区域以外的像素。
+
+    对于 alpha 通道隐写，占用区域内 alpha ≥ 254 的像素设为 255，其余像素清除最低位。
+    NovelAI 在不透明的 alpha 上写入隐写，因此该区域内的 254 均由写入产生。
+    该规则不依赖整幅图像完全不透明（NovelAI 的 WebP 边缘常有少量 alpha < 254 的像素）。
+
+    Returns:
+        alpha 由 254 恢复为 255 的像素数。
+    """
     h = arr.shape[0]
     idx = np.arange(used_bits)
     if channel == 'alpha':
@@ -474,14 +511,17 @@ def wipe_stealth(arr: np.ndarray, channel: str, used_bits: int) -> int:
 
 # ---------------------------------------------------------------- 写入（投毒 / 自定义元数据）
 NAI_TEXT_KEYS = ('Title', 'Description', 'Software', 'Source', 'Generation time', 'Comment')   # PNG 文本块顺序
-STEALTH_KEYS = ('Description', 'Software', 'Source', 'Generation time', 'Comment')            # 隐写层不带 Title
+STEALTH_KEYS = ('Description', 'Software', 'Source', 'Generation time', 'Comment')            # 隐写层不含 Title
 DEFAULT_UC = ('nsfw, lowres, artistic error, film grain, scan artifacts, worst quality, bad quality, jpeg artifacts, '
               'very displeasing, chromatic aberration, dithering, halftone, screentone, multiple views, logo, '
               'too many watermarks, negative space, blank page')
 
 
 def default_comment(width: int = 0, height: int = 0) -> dict:
-    """从零造一份 V5 样子的 Comment，字段和顺序照着真图抄，novelai.net/inspect 和本工具都认。"""
+    """生成 NovelAI Diffusion V5 格式的默认 Comment。
+
+    字段及顺序与实际生成的图片一致，可被 novelai.net/inspect 识别。
+    """
     return {
         'prompt': '', 'steps': 28, 'height': height, 'width': width, 'scale': 5.0, 'uncond_scale': 0.0,
         'cfg_rescale': 0.0, 'seed': random.randrange(1, 2 ** 32), 'n_samples': 1, 'noise_schedule': 'karras',
@@ -504,7 +544,11 @@ def default_comment(width: int = 0, height: int = 0) -> dict:
 
 
 def set_prompt(c: dict, text: str) -> None:
-    """正向提示词要同时改三处：Comment.prompt、v4_prompt.caption.base_caption（V4+ 真正用的）、外层 Description。"""
+    """设置正向提示词。
+
+    同时写入 Comment.prompt 与 v4_prompt.caption.base_caption（V4 及以后版本实际使用该字段）。
+    外层的 Description 由调用方负责同步。
+    """
     c['prompt'] = text
     cap = c.setdefault('v4_prompt', {}).setdefault('caption', {})
     cap['base_caption'] = text
@@ -512,6 +556,7 @@ def set_prompt(c: dict, text: str) -> None:
 
 
 def set_uc(c: dict, text: str) -> None:
+    """设置负面提示词，同时写入 Comment.uc 与 v4_negative_prompt.caption.base_caption。"""
     c['uc'] = text
     cap = c.setdefault('v4_negative_prompt', {}).setdefault('caption', {})
     cap['base_caption'] = text
@@ -519,10 +564,16 @@ def set_uc(c: dict, text: str) -> None:
 
 
 def parse_set(item: str) -> tuple[str, object]:
-    """--set seed=7 / --set uc=lowres / --set sm=true：值先按 JSON 解析，不行就当字符串。"""
+    """解析 ``KEY=VALUE`` 形式的字段设置，如 ``seed=7``、``uc=lowres``、``sm=true``。
+
+    值优先按 JSON 解析，解析失败时作为字符串。
+
+    Raises:
+        ValueError: 缺少 ``=``。
+    """
     k, sep, v = item.partition('=')
     if not sep:
-        raise ValueError(f'--set 要写成 键=值：{item}')
+        raise ValueError(f'--set 的格式应为 KEY=VALUE：{item}')
     try:
         return k.strip(), json.loads(v)
     except json.JSONDecodeError:
@@ -531,10 +582,20 @@ def parse_set(item: str) -> tuple[str, object]:
 
 def make_meta(base: dict | None = None, prompt: str | None = None, uc: str | None = None,
               sets: dict | None = None, size: tuple[int, int] = (0, 0)) -> dict:
-    """要写进图里的元数据。base = 原图的元数据（保留 seed、模型等，只换提示词，看起来更真）；
-    没有就从零造。改过内容后签名必然失效，signed_hash 一律去掉。"""
+    """构造待写入图片的元数据。
+
+    Args:
+        base: 基础元数据，通常取自原图，以保留 seed、模型等字段；为 None 时使用 :func:`default_comment`。
+        prompt: 正向提示词，同时写入 Description。
+        uc: 负面提示词。
+        sets: 逐字段覆盖，键为顶层字段名或 Comment 内的字段名。
+        size: 使用默认 Comment 时写入的宽和高。
+
+    Returns:
+        按 PNG 文本块顺序排列的元数据。修改内容后原签名失效，因此总会移除 signed_hash。
+    """
     meta = copy.deepcopy(base) if base else {}
-    if isinstance(meta.get('Comment'), str):     # 「每块塞同一段」那种：Comment 是原文不是 JSON，照原样留
+    if isinstance(meta.get('Comment'), str):     # 由 fill_meta 生成：Comment 为纯文本而非 JSON，保持原样
         filled = fill_meta(meta['Comment'], sets)
         for k in NAI_TEXT_KEYS:
             if k != 'Comment' and k in meta and k not in (sets or {}):
@@ -571,7 +632,13 @@ def make_meta(base: dict | None = None, prompt: str | None = None, uc: str | Non
 
 
 def compile_rules(rules: dict) -> list[tuple[str, str, "re.Pattern"]]:
-    """改词规则：默认大小写不敏感的子串匹配；old 写成 /正则/ 则按正则。"""
+    """编译词语替换规则。
+
+    默认按子串匹配且不区分大小写；OLD 写作 ``/正则表达式/`` 时按正则表达式匹配。
+
+    Returns:
+        (OLD, NEW, 编译后的模式) 列表。
+    """
     out = []
     for old, new in rules.items():
         if len(old) > 2 and old.startswith('/') and old.endswith('/'):
@@ -583,7 +650,13 @@ def compile_rules(rules: dict) -> list[tuple[str, str, "re.Pattern"]]:
 
 
 def substitute_strings(obj, rules: dict, counts: Counter | None = None):
-    """递归地把 obj 里所有字符串按规则替换（dict / list 深入，其余原样）。返回 (新对象, 各规则命中次数)。"""
+    """按规则递归替换 obj 中的所有字符串。
+
+    遍历 dict 与 list，其他类型保持不变。
+
+    Returns:
+        (替换后的对象, 各规则的命中次数)。
+    """
     counts = Counter() if counts is None else counts
     compiled = rules if isinstance(rules, list) else compile_rules(rules)
     if isinstance(obj, str):
@@ -600,8 +673,11 @@ def substitute_strings(obj, rules: dict, counts: Counter | None = None):
 
 
 def fill_meta(text: str, sets: dict | None = None) -> dict:
-    """-t '内容'：每个分块都塞同一段内容。Comment 也是这段原文；--set 了 Comment 内部字段
-    （seed、uc…）时 Comment 才变成 {"prompt": 内容, "uc": 内容, ...} 这样的 JSON。"""
+    """构造所有字段均为同一文本的元数据（对应 ``-t TEXT``）。
+
+    Comment 也写入该文本本身。sets 中包含 Comment 内部字段（如 seed、uc）时，
+    Comment 改为 ``{"prompt": text, "uc": text, ...}`` 形式的对象。
+    """
     meta = {k: text for k in NAI_TEXT_KEYS}
     inner = {}
     for k, v in (sets or {}).items():
@@ -620,7 +696,7 @@ def _comment_str(meta: dict) -> str:
 
 
 def meta_to_text(meta: dict) -> dict:
-    """PNG 文本块：NAI 的六块，Comment 转成 JSON 字符串。"""
+    """转换为 PNG 文本块内容。Comment 序列化为 JSON 字符串。"""
     out = {}
     for k in NAI_TEXT_KEYS:
         if k in meta and meta[k] is not None:
@@ -629,25 +705,42 @@ def meta_to_text(meta: dict) -> dict:
 
 
 def stealth_payload(meta: dict) -> bytes:
-    """隐写比特流：magic + 32 位数据比特数 + gzip(JSON) + 32 位 FEC 长度（0xffffffff = 无），和 NAI 一致。"""
+    """生成与 NovelAI 格式一致的隐写数据。
+
+    布局：magic ``stealth_pngcomp``、32 位数据长度（比特）、gzip 压缩的 JSON、FEC 长度 ``0xffffffff``（无纠错码）。
+    """
     d = {k: (_comment_str(meta) if k == 'Comment' else meta[k]) for k in STEALTH_KEYS if k in meta}
     data = gzip.compress(json.dumps(d, ensure_ascii=False).encode('utf-8'))
     return b'stealth_pngcomp' + (len(data) * 8).to_bytes(4, 'big') + data + b'\xff\xff\xff\xff'
 
 
 def embed_stealth(arr: np.ndarray, payload: bytes) -> None:
-    """把比特流按列优先写进 alpha 通道最低位（arr 须是 RGBA，就地修改）。"""
+    """按列优先顺序将数据写入 alpha 通道的最低位。
+
+    Args:
+        arr: RGBA 像素数组，就地修改。
+        payload: :func:`stealth_payload` 的返回值。
+
+    Raises:
+        ValueError: 图像像素数少于数据比特数。
+    """
     bits = np.unpackbits(np.frombuffer(payload, dtype=np.uint8))
     h, w = arr.shape[:2]
     if bits.size > h * w:
-        raise ValueError(f'图太小，装不下隐写：需要 {bits.size} 像素，只有 {h * w}')
+        raise ValueError(f'图像尺寸不足，无法写入隐写数据：需要 {bits.size} 个像素，实际为 {h * w} 个')
     idx = np.arange(bits.size)
     arr[idx % h, idx // h, 3] = (arr[idx % h, idx // h, 3] & 0xFE) | bits
 
 
 def meta_to_exif(meta: dict) -> bytes:
-    """WebP / JPEG 用的 EXIF，照 NAI 的 WebP 下载布局：Software = Source（模型名+哈希），DocumentName = Title，
-    ImageDescription = Description，UserComment = 整份 JSON。返回带 Exif\\0\\0 头的字节。"""
+    """生成 WebP 与 JPEG 使用的 EXIF 数据，字段布局与 NovelAI 的 WebP 下载一致。
+
+    Software = Source（模型名与哈希），DocumentName = Title，ImageDescription = Description，
+    UserComment = 完整元数据的 JSON。
+
+    Returns:
+        以 ``Exif\\0\\0`` 开头的字节串。
+    """
     ex = Image.Exif()
     if meta.get('Source'):
         ex[0x0131] = str(meta['Source'])
@@ -661,14 +754,21 @@ def meta_to_exif(meta: dict) -> bytes:
 
 
 def load_meta_json(path: Path) -> dict:
-    """读预设 / 模板文件：顶层得是对象，_ 开头的键丢掉，Comment 字符串展开。"""
+    """读取预设或模板文件。
+
+    忽略以 ``_`` 开头的键，并将 Comment 字符串解析为对象。
+
+    Raises:
+        ValueError: 顶层不是 JSON 对象。
+    """
     d = json.loads(Path(path).read_text('utf-8'))
     if not isinstance(d, dict):
-        raise ValueError('预设得是一个 JSON 对象')
+        raise ValueError(f'{path}：预设文件的顶层必须是 JSON 对象')
     return expand_comment({k: v for k, v in d.items() if not k.startswith('_')})
 
 
 def config_dir() -> Path:
+    """返回配置目录：Windows 为 %APPDATA%\\nai-meta，其他系统为 $XDG_CONFIG_HOME/nai-meta（默认 ~/.config/nai-meta）。"""
     if os.name == 'nt':
         base = Path(os.environ.get('APPDATA') or Path.home() / 'AppData' / 'Roaming')
     else:
@@ -678,7 +778,10 @@ def config_dir() -> Path:
 
 # ---------------------------------------------------------------- 跨平台
 def setup_console() -> None:
-    """Windows 上 stdout 重定向到文件 / 管道时默认是 GBK，✔ ▸ 这类符号会直接报错；统一成 UTF-8。"""
+    """将标准输出与标准错误设为 UTF-8。
+
+    Windows 上重定向到文件或管道时默认编码为 GBK，输出 ✔ 等符号会引发编码错误。
+    """
     for stream in (sys.stdout, sys.stderr):
         try:
             stream.reconfigure(encoding='utf-8', errors='replace')
@@ -687,8 +790,11 @@ def setup_console() -> None:
 
 
 def _plain_symbols() -> bool:
-    """老式 cmd / PowerShell 窗口的字体常缺 ✔ ▸ ⚠，用 GBK 里有的 √ × > ! 代替。
-    Windows Terminal（有 WT_SESSION 环境变量）不用降级。NAI_META_ASCII=1/0 可强制。"""
+    """判断是否使用 GBK 字符集内的替代符号（√ × > !）。
+
+    传统 cmd 与 PowerShell 窗口的默认字体缺少 ✔ ▸ ⚠ 等字形；Windows Terminal（设置了 WT_SESSION）不受影响。
+    环境变量 NAI_META_ASCII 设为 1 或 0 可强制开启或关闭。
+    """
     flag = os.environ.get('NAI_META_ASCII')
     if flag is not None:
         return flag not in ('0', '')
@@ -703,7 +809,7 @@ GLOB_CHARS = ('*', '?', '[')
 
 
 def confirm(prompt: str) -> bool:
-    """命令行里的 y/N。回车、n、Ctrl-C、Ctrl-D 都算否。"""
+    """在终端中请求确认。仅输入 y 或 yes 视为同意；回车、其他输入、Ctrl-C、Ctrl-D 均视为拒绝。"""
     try:
         return input(prompt).strip().lower() in ('y', 'yes')
     except (EOFError, KeyboardInterrupt):
@@ -711,16 +817,34 @@ def confirm(prompt: str) -> bool:
         return False
 
 
-# ---------------------------------------------------------------- 杂项
+# ---------------------------------------------------------------- 输出与文件遍历
+def error(message: str, hint: str | None = None) -> None:
+    """向标准错误输出错误信息，可附带一行提示。"""
+    sys.stdout.flush()                           # 先输出已缓冲的标准输出，保持前后顺序
+    print(f'错误：{message}', file=sys.stderr)
+    if hint:
+        print(f'提示：{hint}', file=sys.stderr)
+
+
+def warn(message: str, hint: str | None = None) -> None:
+    """向标准错误输出警告信息，可附带一行提示。"""
+    sys.stdout.flush()                           # 先输出已缓冲的标准输出，保持前后顺序
+    print(f'警告：{message}', file=sys.stderr)
+    if hint:
+        print(f'提示：{hint}', file=sys.stderr)
+
 def iter_images(paths, recursive: bool = False) -> Iterator[tuple[Path, Path]]:
-    """产出 (文件, 相对路径)。目录输入时相对路径保留层级，供 --outdir 用；单文件就是文件名。
-    带 * ? [ 的参数自己展开：Windows 的 cmd / PowerShell 不替外部程序展开通配符。"""
+    """遍历输入路径，产出 (图片文件, 相对路径)。
+
+    输入为目录时，相对路径保留目录层级，供 ``--outdir`` 使用；输入为文件时，相对路径为文件名。
+    含 ``* ? [`` 的参数由本函数展开，因为 Windows 的 cmd 与 PowerShell 不会为外部程序展开通配符。
+    """
     for p in paths:
         p = Path(p)
         if any(ch in str(p) for ch in GLOB_CHARS) and not p.exists():
             matches = sorted(glob.glob(str(p), recursive=True))
             if not matches:
-                print(f'没有匹配: {p}', file=sys.stderr)
+                warn(f'没有与 {p} 匹配的文件')
                 continue
             yield from iter_images(matches, recursive)
             continue
@@ -732,10 +856,11 @@ def iter_images(paths, recursive: bool = False) -> Iterator[tuple[Path, Path]]:
         elif p.is_file():
             yield p, Path(p.name)
         else:
-            print(f'找不到: {p}', file=sys.stderr)
+            warn(f'{p} 不存在')
 
 
 def fmt_size(n: int) -> str:
+    """格式化文件大小，使用二进制单位（KiB、MiB）。"""
     for unit in ('B', 'KiB', 'MiB', 'GiB'):
         if n < 1024 or unit == 'GiB':
             return f'{n:.0f} {unit}' if unit == 'B' else f'{n:.2f} {unit}'

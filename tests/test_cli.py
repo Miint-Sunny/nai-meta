@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""nai 总入口的分发、通配符自展开。"""
+"""nai 统一入口的子命令分发与通配符展开。"""
 import numpy as np
 from PIL import Image
 
@@ -17,7 +17,7 @@ def test_dispatch(tmp_path, capsys):
     assert nai(['i', str(p)]) == 0
     assert 'a.png' in capsys.readouterr().out
     assert nai(['s', '-n', str(p)]) == 0
-    assert 'dry-run' in capsys.readouterr().out
+    assert '试运行' in capsys.readouterr().out
     assert nai(['inspect', '-j', str(p)]) == 0
     assert nai(['strip', '-n', str(p)]) == 0
 
@@ -25,7 +25,7 @@ def test_dispatch(tmp_path, capsys):
 def test_dispatch_errors(capsys):
     assert nai([]) == 1
     assert nai(['--help']) == 0
-    assert '子命令' in capsys.readouterr().out
+    assert '命令：' in capsys.readouterr().out
     assert nai(['bogus']) == 2
     assert nai(['-V']) == 0
     assert capsys.readouterr().out.startswith('nai-meta ')

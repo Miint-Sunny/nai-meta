@@ -1,12 +1,11 @@
 # -*- coding: utf-8 -*-
-"""nai-inspect：读出 NovelAI 图片的生成参数。
+"""nai-inspect：读取 NovelAI 图片的生成参数。
 
-三路取数：PNG 文本块 → LSB 隐写 → EXIF / 注释里塞的 JSON。默认展示文本块（没有就用隐写），
-两层都在时顺手比对一遍，不一致会提示——文本块被人改过 / 投毒时隐写往往还是原样。
+数据来源依次为 PNG 文本块、LSB 隐写层、EXIF 与注释中的 JSON。默认显示明文层，不存在时显示隐写层。
+两层同时存在时比对其内容：明文层被修改或写入伪造数据后，隐写层通常仍保留原始内容。
 """
 from __future__ import annotations
 
-import argparse
 import json
 import shutil
 import sys
@@ -17,20 +16,25 @@ import wcwidth
 from PIL import Image
 from PIL.ExifTags import IFD, TAGS
 
-from .core import (COLOR_TYPES, SYM, diff_meta, expand_comment, find_stealth, is_nai,
+from . import __version__
+from .argparse_zh import ArgumentParser
+from .core import (COLOR_TYPES, SYM, diff_meta, error, expand_comment, find_stealth, is_nai,
                    iter_images, meta_from_text, num, parse_a1111, scan_png, setup_console, summarize)
 
+REPO_URL = 'https://github.com/Miint-Sunny/nai-meta'
 
-# ---------------------------------------------------------------- 取数
+
+# ---------------------------------------------------------------- 读取
 def _exif_value(v):
+    """将 EXIF 值转换为可显示的形式。字节串按 UTF-8 解码，并去掉 UserComment 的字符集前缀和首尾 NUL。"""
     if isinstance(v, bytes):
-        if v[:8] in (b'ASCII\x00\x00\x00', b'UNICODE\x00', b'\x00' * 8):   # UserComment 的字符集前缀
+        if v[:8] in (b'ASCII\x00\x00\x00', b'UNICODE\x00', b'\x00' * 8):   # UserComment 的 8 字节字符集标识
             v = v[8:]
         try:
             return v.decode('utf-8').strip('\x00')
         except UnicodeDecodeError:
             return f'<{len(v)} bytes>'
-    if isinstance(v, str):                       # 前后的 NUL 没意义（见 exif_meta）
+    if isinstance(v, str):                       # 首尾 NUL 无意义，原因见 exif_meta
         return v.strip('\x00')
     if isinstance(v, (int, float)):
         return v
@@ -38,6 +42,7 @@ def _exif_value(v):
 
 
 def read_exif(im: Image.Image) -> dict | None:
+    """读取 IFD0 与 Exif IFD 中的全部标签，返回 {标签名: 值}；没有 EXIF 时返回 None。"""
     try:
         ex = im.getexif()
     except Exception:
@@ -56,9 +61,14 @@ def read_exif(im: Image.Image) -> dict | None:
 
 
 def exif_meta(ex: dict | None) -> dict | None:
-    """NAI 的 WebP 把元数据写在 EXIF 里：Software = 模型名+哈希（相当于 Source）、DocumentName = Title、
-    ImageDescription = 提示词、UserComment = {"Comment": "..."}。整理成和 PNG 文本块同构的 dict，
-    好让比对和摘要复用。别的工具塞在 UserComment 里的 A1111 参数也认。"""
+    """将 EXIF 中的 NovelAI 元数据整理为与 PNG 文本块相同的结构。
+
+    NovelAI 的 WebP 将元数据写入 EXIF：Software 为模型名与哈希（对应 Source），DocumentName 为 Title，
+    ImageDescription 为提示词，UserComment 为完整元数据的 JSON。也识别其他工具写入 UserComment 的 A1111 参数。
+
+    Returns:
+        元数据 dict；不含可识别的元数据时返回 None。
+    """
     if not ex:
         return None
     m = None
@@ -79,18 +89,25 @@ def exif_meta(ex: dict | None) -> dict | None:
         m['Description'] = ex['ImageDescription']
     if isinstance(ex.get('DocumentName'), str):
         m.setdefault('Title', ex['DocumentName'])
-    # NAI 的 WebP：提示词带中文时 Description 前面会多 4 个 NUL（ImageDescription 和 UserComment 的 JSON 里都有，
-    # 隐写层里没有）。NUL 在提示词里没有意义，留着会误报两层不一致、还会跟着 -p 进剪贴板
+    # 提示词含中文时，NovelAI 的 WebP 在 ImageDescription 和 UserComment 内 Description 的开头写入 4 个 NUL，
+    # 隐写层中没有。去掉 NUL，避免误报两层不一致，也避免 -p 输出中带有 NUL
     return {k: v.strip('\x00') if isinstance(v, str) else v for k, v in m.items()}
 
 
 def inspect_file(path: Path) -> dict:
+    """读取文件的全部元数据层，并在两层均为 NovelAI 元数据时比对其内容。
+
+    Returns:
+        记录 dict，主要字段：text_chunks（文本块原文）、text_meta（解析后的文本块元数据）、
+        stealth（隐写层）、exif、exif_meta、outer_layer（明文层来源）、consistent（两层是否一致，
+        无法比较时为 None）。文件无法打开时仅含 file 与 error。
+    """
     rec: dict = {'file': str(path)}
     try:
         im = Image.open(path)
         im.load()
     except Exception as e:
-        rec['error'] = f'打不开: {e}'
+        rec['error'] = f'无法打开：{e}'
         return rec
     rec.update(format=im.format, mode=im.mode, width=im.size[0], height=im.size[1])
 
@@ -104,7 +121,7 @@ def inspect_file(path: Path) -> dict:
         if scan.texts:
             text_meta = expand_comment(dict(scan.texts))
     else:
-        # JPEG 注释 / WebP 等：Pillow 放在 info 里
+        # JPEG 注释等由 Pillow 放在 info 中
         cm = im.info.get('comment')
         if cm:
             rec['comment'] = _exif_value(cm)
@@ -117,12 +134,12 @@ def inspect_file(path: Path) -> dict:
         rec['stealth'] = {'channel': st.channel, 'compressed': st.compressed, 'magic': st.magic,
                           'bytes': st.nbytes, 'fec_bytes': st.fec_bytes, 'raw': st.text, 'meta': st.meta}
 
-    # 3. EXIF（PNG eXIf 块 / JPEG APP1 / WebP EXIF 块）。NAI 的 WebP 下载把参数写在这里
+    # 3. EXIF（PNG eXIf 块、JPEG APP1 段、WebP EXIF 块）。NovelAI 的 WebP 将参数写在此处
     rec['exif'] = read_exif(im)
     rec['exif_meta'] = exif_meta(rec['exif'])
     rec['xmp'] = len(im.info['xmp']) if im.info.get('xmp') else None
 
-    # 明文层（文本块，没有就是 EXIF）和隐写层都是 NAI 数据时比对
+    # 明文层（文本块，不存在时为 EXIF）与隐写层均为 NovelAI 元数据时进行比对
     outer, outer_name = (text_meta, '文本块') if text_meta else (rec['exif_meta'], 'EXIF')
     rec['outer_layer'] = outer_name if outer else None
     sm = rec['stealth']['meta'] if rec['stealth'] else None
@@ -135,23 +152,30 @@ def inspect_file(path: Path) -> dict:
 
 
 def choose_meta(rec: dict, prefer: str) -> tuple[dict | None, str | None]:
-    """按 --text/--stealth 或自动顺序挑一份来做摘要。返回 (meta, 来源名)。
-    自动顺序：明文层（PNG 文本块 / WebP 的 EXIF）→ 隐写 → A1111 参数 → JPEG 注释。"""
+    """选择用于显示的元数据。
+
+    Args:
+        prefer: ``text`` 仅用明文层，``stealth`` 仅用隐写层，``auto`` 依次尝试明文层（PNG 文本块或 WebP 的 EXIF）、
+            隐写层、A1111 参数和 JPEG 注释。
+
+    Returns:
+        (元数据, 来源名称)；没有可用数据时返回 (None, None)。
+    """
     text_meta, ex_meta = rec.get('text_meta'), rec.get('exif_meta')
     st_meta = rec['stealth']['meta'] if rec.get('stealth') else None
     outer, outer_name = (text_meta, '文本块') if is_nai(text_meta) else (ex_meta, 'EXIF')
     if prefer == 'text':
         return (outer, outer_name) if is_nai(outer) else (None, None)
     if prefer == 'stealth':
-        return (st_meta, '隐写') if is_nai(st_meta) else (None, None)
+        return (st_meta, '隐写层') if is_nai(st_meta) else (None, None)
     if is_nai(outer):
         return outer, outer_name
     if is_nai(st_meta):
-        return st_meta, '隐写'
+        return st_meta, '隐写层'
     a1111 = parse_a1111((rec.get('text_chunks') or {}).get('parameters', ''))
     if a1111:
         return a1111, '文本块 parameters'
-    if ex_meta:                                  # EXIF 里的 A1111 参数之类
+    if ex_meta:                                  # 例如 EXIF 中的 A1111 参数
         return ex_meta, 'EXIF'
     m = meta_from_text(rec['comment']) if isinstance(rec.get('comment'), str) else None
     return (m, '注释') if m else (None, None)
@@ -163,7 +187,7 @@ def _width() -> int:
 
 
 def _dw(text: str) -> int:
-    """终端显示宽度：中文占两格。"""
+    """返回终端显示宽度，宽字符计 2 列。"""
     return sum(max(wcwidth.wcwidth(ch), 0) for ch in text)
 
 
@@ -178,7 +202,7 @@ def _rule(title: str, width: int) -> str:
 
 def _meta_line(rec: dict, src: str | None) -> str:
     tc = rec.get('text_chunks') or {}
-    parts = [f"文本块 {SYM['yes']} {len(tc)}" if tc else f"文本块 {SYM['no']}"]
+    parts = [f"文本块 {SYM['yes']} {len(tc)} 个" if tc else f"文本块 {SYM['no']}"]
     st = rec.get('stealth')
     if st:
         parts.append(f"隐写 {SYM['yes']} {st['channel']}{'+gzip' if st['compressed'] else ''} {st['bytes']} B"
@@ -186,15 +210,15 @@ def _meta_line(rec: dict, src: str | None) -> str:
     else:
         parts.append(f"隐写 {SYM['no']}")
     if rec.get('exif'):
-        parts.append(f"EXIF {SYM['yes']} {len(rec['exif'])} 项" + ('，含 NAI 参数' if is_nai(rec.get('exif_meta')) else ''))
+        parts.append(f"EXIF {SYM['yes']} {len(rec['exif'])} 项" + ('（含 NovelAI 参数）' if is_nai(rec.get('exif_meta')) else ''))
     if rec.get('xmp'):
         parts.append(f"XMP {SYM['yes']} {rec['xmp']} B")
     if rec.get('consistent') is True:
         parts.append('两层一致')
     elif rec.get('consistent') is False:
-        parts.append(f"{SYM['warn']} {rec.get('outer_layer') or '明文层'}与隐写不一致: " + ', '.join(rec['diff_keys']))
+        parts.append(f"{SYM['warn']} {rec.get('outer_layer') or '明文层'}与隐写层不一致：" + '、'.join(rec['diff_keys']))
     if src:
-        parts.append(f'读自{src}')
+        parts.append(f'显示来源：{src}')
     return _lab('元数据') + ' · '.join(parts)
 
 
@@ -204,17 +228,18 @@ def _describe_chunk(key: str, text: str, full: bool) -> str:
             try:
                 d = json.loads(text)
                 nodes = d.get('nodes') if isinstance(d, dict) and 'nodes' in d else d
-                return f'{key}: ComfyUI 工作流，{len(nodes)} 个节点（-f 看全文）'
+                return f'{key}：ComfyUI 工作流，{len(nodes)} 个节点（使用 -f 显示全文）'
             except (json.JSONDecodeError, TypeError, AttributeError):
                 pass
         if key.startswith(('XML:', 'Raw profile')) or len(text) > 600:
-            return f'{key}: {len(text)} 字符（-f 看全文）'
+            return f'{key}：{len(text)} 个字符（使用 -f 显示全文）'
     if '\n' not in text and len(text) <= 80:
-        return f'{key}: {text}'
-    return f'{key}:\n{text}'
+        return f'{key}：{text}'
+    return f'{key}：\n{text}'
 
 
 def render(rec: dict, prefer: str, full: bool, raw: bool) -> str:
+    """将 :func:`inspect_file` 的记录格式化为终端显示文本。"""
     W = _width()
     L = [f"{SYM['bar']} {rec['file']}"]
     if 'error' in rec:
@@ -226,16 +251,16 @@ def render(rec: dict, prefer: str, full: bool, raw: bool) -> str:
     L.append(_meta_line(rec, src))
     tc = rec.get('text_chunks') or {}
     if meta is None:
-        for k, v in tc.items():                  # 不是 NAI 也不是 A1111 的文本块：能认的报一句，其余原样给
+        for k, v in tc.items():                  # 既非 NovelAI 也非 A1111 格式：可识别的给出摘要，其余原样显示
             L.append(_describe_chunk(k, v, full))
         if rec.get('stealth'):
-            L.append(_describe_chunk('隐写原文', rec['stealth']['raw'], full))
+            L.append(_describe_chunk('隐写层原文', rec['stealth']['raw'], full))
         if rec.get('exif'):
-            L.append('EXIF:')
+            L.append('EXIF：')
             for k, v in rec['exif'].items():
-                L.append(f'    {k}: {str(v)[:200]}')
+                L.append(f'    {k}：{str(v)[:200]}')
         if not tc and not rec.get('exif') and not rec.get('stealth'):
-            L.append('    没有任何元数据（可能被转发剥掉、或重编码 / 缩放过）')
+            L.append('    未检测到元数据（可能已被转发平台移除，或图像经过重新编码、缩放）')
         return '\n'.join(L)
 
     p = summarize(meta)
@@ -252,7 +277,7 @@ def render(rec: dict, prefer: str, full: bool, raw: bool) -> str:
     if p['width'] and p['height']:
         size = f"{p['width']}×{p['height']}"
         if (p['width'], p['height']) != (rec['width'], rec['height']):
-            size += f"（文件实际 {rec['width']}×{rec['height']}）"
+            size += f"（文件实际尺寸 {rec['width']}×{rec['height']}）"
     else:
         size = f"{rec['width']}×{rec['height']}"
     if p['generation_time'] is not None:
@@ -267,7 +292,7 @@ def render(rec: dict, prefer: str, full: bool, raw: bool) -> str:
     if p['noise_schedule']:
         samp.append(p['noise_schedule'])
     if p['steps'] is not None:
-        samp.append(f"{p['steps']} steps")
+        samp.append(f"{p['steps']} 步")
     rows.append(('采样', ' · '.join(samp) or '?'))
     guid = []
     if p['scale'] is not None:
@@ -279,7 +304,7 @@ def render(rec: dict, prefer: str, full: bool, raw: bool) -> str:
     if p['toggles']:
         rows.append(('开关', ' · '.join(k if v is True else f'{k} {v}' for k, v in p['toggles'].items())))
     if p['signed_hash']:
-        rows.append(('签名', f"有（NAI 签名 {p['signed_hash'][:12]}…，未验证）"))
+        rows.append(('签名', f"{p['signed_hash'][:12]}…（未验证）"))
     L.append('')
     L += [_lab(k) + v for k, v in rows]
 
@@ -302,11 +327,12 @@ def render(rec: dict, prefer: str, full: bool, raw: bool) -> str:
         for k, v in tc.items():
             block(f'文本块 {k}', v)
         if rec.get('stealth'):
-            block('隐写原文', rec['stealth']['raw'])
+            block('隐写层原文', rec['stealth']['raw'])
     return '\n'.join(L)
 
 
 def prompt_only(rec: dict, prefer: str) -> str | None:
+    """返回正向提示词与各角色提示词；没有元数据时返回 None。"""
     meta, _ = choose_meta(rec, prefer)
     if meta is None:
         return None
@@ -317,27 +343,50 @@ def prompt_only(rec: dict, prefer: str) -> str | None:
     return '\n'.join(out)
 
 
-def main(argv=None) -> int:
+EPILOG = f'''\
+示例：
+  naii a.png b.png           显示生成参数
+  naii -r ./dir -j > a.json  递归读取目录并导出 JSON
+  naii -p a.png | pbcopy     复制正向提示词（macOS）
+  naii --stealth a.png       仅读取隐写层
+
+文档：{REPO_URL}'''
+
+
+def build_parser(prog: str) -> ArgumentParser:
+    ap = ArgumentParser(
+        prog=prog,
+        description='读取 NovelAI 图片的生成参数。依次检查 PNG 文本块、LSB 隐写层和 EXIF，\n'
+                    '两层同时存在时比对其内容是否一致。',
+        epilog=EPILOG, add_help=False)
+    ap.add_argument('paths', nargs='+', metavar='PATH', help='图片文件或目录，支持通配符')
+    g = ap.add_argument_group('数据来源')
+    src = g.add_mutually_exclusive_group()
+    src.add_argument('--text', action='store_true', help='仅读取明文层（PNG 文本块或 WebP 的 EXIF）')
+    src.add_argument('--stealth', action='store_true', help='仅读取 LSB 隐写层')
+    g = ap.add_argument_group('输出')
+    g.add_argument('-f', '--full', action='store_true', help='显示 Comment 中的全部字段')
+    g.add_argument('--raw', action='store_true', help='附加显示原始文本块与隐写层 JSON')
+    g.add_argument('-j', '--json', action='store_true', help='以 JSON 格式输出（单个文件为对象，多个文件为数组）')
+    g.add_argument('-p', '--prompt', action='store_true', help='仅输出正向提示词与角色提示词')
+    g = ap.add_argument_group('其他')
+    g.add_argument('-h', '--help', action='help', help='显示此帮助信息并退出')
+    g.add_argument('-r', '--recursive', action='store_true', help='递归处理子目录')
+    g.add_argument('-V', '--version', action='version', version=f'nai-meta {__version__}', help='显示版本信息并退出')
+    return ap
+
+
+def main(argv=None, prog: str | None = None) -> int:
     setup_console()
-    ap = argparse.ArgumentParser(
-        prog='nai-inspect',
-        description='读出 NovelAI 图片的生成参数：PNG 文本块 + LSB 隐写（+ EXIF）。',
-        epilog='示例：nai-inspect a.png b.png   |   nai-inspect -r ./图 --json > meta.json   |   nai-inspect -p a.png | pbcopy')
-    ap.add_argument('paths', nargs='+', help='图片文件或目录')
-    ap.add_argument('-r', '--recursive', action='store_true', help='目录递归')
-    g = ap.add_mutually_exclusive_group()
-    g.add_argument('--text', action='store_true', help='只用明文层：PNG 文本块 / WebP 的 EXIF（不看隐写）')
-    g.add_argument('--stealth', action='store_true', help='只用隐写（不看文本块）')
-    ap.add_argument('-f', '--full', action='store_true', help='把 Comment 里的全部参数也打出来')
-    ap.add_argument('--raw', action='store_true', help='附带原始文本块 / 隐写 JSON 字符串')
-    ap.add_argument('-j', '--json', action='store_true', help='输出 JSON（单图一个对象，多图为数组）')
-    ap.add_argument('-p', '--prompt', action='store_true', help='只输出正向提示词（含角色），方便复制')
-    a = ap.parse_args(argv)
+    if prog is None:
+        invoked = Path(sys.argv[0]).stem
+        prog = invoked if invoked in ('naii', 'nai-inspect') else 'naii'
+    a = build_parser(prog).parse_args(argv)
     prefer = 'text' if a.text else 'stealth' if a.stealth else 'auto'
 
     files = [f for f, _ in iter_images(a.paths, a.recursive)]
     if not files:
-        print('没有找到图片', file=sys.stderr)
+        error('未找到图片文件')
         return 1
     recs = [inspect_file(f) for f in files]
     errors = sum('error' in r for r in recs)
@@ -355,7 +404,7 @@ def main(argv=None) -> int:
             t = prompt_only(r, prefer)
             if len(recs) > 1:
                 print(f"# ===== {r['file']}")
-            print(t if t is not None else '（没有提示词）')
+            print(t if t is not None else '（无提示词）')
     else:
         print('\n\n'.join(render(r, prefer, a.full, a.raw) for r in recs))
     return 1 if errors else 0

@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
-"""nai：伞形总入口。现在挂两个子命令，以后的生图 agent 之类也往这里挂。
+"""nai：统一入口，将子命令分发给各命令的 main 函数。
 
-加子命令只需往 COMMANDS 里加一行：(名字们, 入口函数, 一句说明)。
-入口函数签名 main(argv: list[str]) -> int，自己用 argparse 解析 argv。
-已预留的名字：gen / agent（LLM 驱动 NovelAI API 生图）。
+新增子命令时，在 COMMANDS 中添加一项 (名称, 入口函数, 说明)。入口函数的签名为
+``main(argv: list[str], prog: str) -> int``，自行解析 argv。
+gen 与 agent 两个名称保留给后续的生成功能（通过 NovelAI API 生成图片）。
 """
 from __future__ import annotations
 
@@ -14,17 +14,19 @@ from .nai_inspect import main as inspect_main
 from .nai_strip import main as strip_main
 
 COMMANDS = [
-    # (名字们, 入口, 说明)
-    (('i', 'inspect'), inspect_main, '读出生成参数        （同 naii / nai-inspect）'),
-    (('s', 'strip'), strip_main, '剥掉元数据          （同 nais / nai-strip；nai s tui 进交互模式）'),
+    (('i', 'inspect'), inspect_main, '读取生成参数（等同于 naii）'),
+    (('s', 'strip'), strip_main, '移除元数据（等同于 nais；nai s tui 进入交互模式）'),
 ]
 
 
 def usage() -> str:
-    lines = ['用法: nai <子命令> [参数...]', '']
+    lines = ['用法：nai <命令> [选项] [参数...]', '', '命令：']
     for names, _, desc in COMMANDS:
-        lines.append(f'  nai {" | ".join(names):<16} {desc}')
-    lines += ['', '  nai i a.png           nai s -i *.png           nai s tui           nai s -h 看全部选项']
+        lines.append(f'  {", ".join(names):<14}{desc}')
+    lines += ['', '选项：',
+              f'  {"-h, --help":<14}显示此帮助信息并退出',
+              f'  {"-V, --version":<14}显示版本信息并退出',
+              '', '使用 nai <命令> -h 查看该命令的选项。']
     return '\n'.join(lines)
 
 
@@ -41,8 +43,8 @@ def main(argv=None) -> int:
         return 0
     for names, fn, _ in COMMANDS:
         if argv[0] in names:
-            return fn(argv[1:])
-    print(f'未知子命令: {argv[0]}\n\n{usage()}', file=sys.stderr)
+            return fn(argv[1:], prog=f'nai {names[0]}')
+    print(f'错误：未知命令：{argv[0]}\n提示：使用 nai -h 查看可用命令', file=sys.stderr)
     return 2
 
 

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""-N：输出改名成 日期-编号；同目录接着已有的号；-i -N 原地改名；NAI 默认文件名提醒；TUI /n。"""
+"""按日期重命名（-N）：序号接续目录中已有的编号；-i -N 重命名源文件；NovelAI 默认文件名的警告；交互模式的 /n。"""
 import json
 import shlex
 
@@ -34,13 +34,13 @@ def test_rename_next_to_original_continues_numbering(tmp_path, cfg, capsys):
     d.mkdir()
     nai_png(d / f'{NAI_STYLE}.png')
     nai_png(d / 'b.png')
-    (d / f'{DAY}-0003.webp').write_bytes(b'')                           # 同日已有 0003（别的扩展名也算）
-    (d / '20260922-0009.png').write_bytes(b'')                          # 别的日子不算
+    (d / f'{DAY}-0003.webp').write_bytes(b'')                           # 当天已有 0003（不区分扩展名）
+    (d / '20260922-0009.png').write_bytes(b'')                          # 其他日期的编号不计入
     assert strip_main([str(d / f'{NAI_STYLE}.png'), str(d / 'b.png'), '-N']) == 0
     assert clean(d / f'{DAY}-0004.png') and clean(d / f'{DAY}-0005.png')
-    assert (d / f'{NAI_STYLE}.png').exists()                            # 旁边模式不动原图
-    assert 'NAI 默认命名' not in capsys.readouterr().out                 # 已经改名就不提醒
-    assert strip_main([str(d / 'b.png'), '-N']) == 0                    # 再跑一次接着排
+    assert (d / f'{NAI_STYLE}.png').exists()                            # 输出到源文件所在目录时，源文件保留
+    assert 'NovelAI 默认文件名' not in capsys.readouterr().err          # 已使用 -N 时不提示
+    assert strip_main([str(d / 'b.png'), '-N']) == 0                    # 再次运行时序号继续递增
     assert (d / f'{DAY}-0006.png').exists()
 
 
@@ -51,20 +51,20 @@ def test_rename_outdir_recursive_and_dry_run(tmp_path, cfg, capsys):
     nai_png(src / 'sub' / 'b.png')
     nai_png(src / 'sub' / 'c.png')
     out = tmp_path / 'out'
-    assert strip_main([str(src), '-r', '-d', str(out), '-N', '-n']) == 0      # dry-run：报名字不写
+    assert strip_main([str(src), '-r', '-d', str(out), '-N', '-n']) == 0      # 试运行：报告文件名，不写入文件
     got = capsys.readouterr().out
     assert f'{DAY}-0001.png' in got and f'{DAY}-0002.png' in got and not out.exists()
     assert strip_main([str(src), '-r', '-d', str(out), '-N', '-y']) == 0
     assert sorted(p.relative_to(out).as_posix() for p in out.rglob('*.png')) == [
-        f'{DAY}-0001.png', f'sub/{DAY}-0001.png', f'sub/{DAY}-0002.png']  # 每个目录各自从 0001 起
+        f'{DAY}-0001.png', f'sub/{DAY}-0001.png', f'sub/{DAY}-0002.png']  # 各目录分别从 0001 开始编号
 
 
 def test_rename_in_place_removes_original(tmp_path, cfg):
     a, b = tmp_path / f'{NAI_STYLE}.png', tmp_path / f'{DAY}-0001.png'
     nai_png(a)
-    nai_png(b)                                                           # 已经是编号名：原地剥，不换号
+    nai_png(b)                                                           # 文件名已是“日期-序号”格式：原地处理，保留原名
     plain = tmp_path / 'plain.png'
-    Image.fromarray(random_rgba()[:, :, :3]).save(plain)                # 没元数据：只改名
+    Image.fromarray(random_rgba()[:, :, :3]).save(plain)                # 不含元数据：只重命名
     assert strip_main([str(a), str(b), str(plain), '-i', '-N']) == 0
     names = sorted(p.name for p in tmp_path.glob('*.png'))
     assert names == [f'{DAY}-0001.png', f'{DAY}-0002.png', f'{DAY}-0003.png']
@@ -76,8 +76,8 @@ def test_rename_conflicts_and_hint(tmp_path, cfg, capsys):
     nai_png(src)
     assert strip_main([str(src), '-o', str(tmp_path / 'x.png'), '-N']) == 1
     assert strip_main([str(src)]) == 0
-    out = capsys.readouterr().out
-    assert 'NAI 默认命名' in out and '-N' in out                         # 没改名：提醒一句
+    err = capsys.readouterr().err
+    assert 'NovelAI 默认文件名' in err and '-N' in err                   # 未使用 -N：在标准错误输出警告与提示
     assert (tmp_path / f'{NAI_STYLE}_clean.png').exists()
 
 
@@ -90,5 +90,5 @@ def test_tui_rename_toggle_is_remembered(tmp_path, cfg):
     assert drive_tui(f'/n\n{q(str(d / "a.png"))}\n/q\n') == 0
     assert (d / f'{DAY}-0001.png').exists()
     assert json.loads((cfg / 'tui.json').read_text('utf-8'))['rename'] is True
-    assert drive_tui(f'{q(str(d / "b.png"))}\n/q\n') == 0             # 重进仍开着，接着排号
+    assert drive_tui(f'{q(str(d / "b.png"))}\n/q\n') == 0             # 重新启动后设置仍为开启，序号继续递增
     assert (d / f'{DAY}-0002.png').exists()
