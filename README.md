@@ -190,14 +190,13 @@ nais -n ./images              # 试运行，只报告将执行的操作
 输入包含目录或通配符时，处理前会显示文件数量和输出位置，并请求确认。逐个指定的文件不请求确认。
 
 ```
-$ nais ./images
-./images：共 12 个文件（png 10、jpg 2），输出到源文件所在目录，文件名追加 _clean
+$ nais ./images -d ./clean
+./images：共 3 个文件（png 2、jpg 1），输出到目录 ./clean
 是否继续？[y/N] y
-✔ a.png → a_clean.png  已移除文本块 ×6（Title、Description、…）、LSB 隐写（alpha+gzip 4726 B）；alpha 已恢复为 255；1.64 MiB → 1.65 MiB
-✔ b.jpg → b_clean.jpg  已移除 APP1/EXIF-XMP 段（6.06 KiB）；812.40 KiB → 806.34 KiB
-· c.png  已跳过：输出文件 c_clean.png 已存在（使用 --overwrite 覆盖）
-…
-完成：共 12 个文件，成功 11 个，跳过 1 个，失败 0 个
+✔ a.png → clean/a.png  已移除文本块 ×6（Title、Description、Software、Source、Generation time、Comment）、LSB 隐写（alpha+gzip 4726 B）；alpha 已恢复为 255；1.64 MiB → 1.65 MiB
+✔ b.jpg → clean/b.jpg  已移除 APP1/EXIF-XMP 段（66 B）；280.33 KiB → 280.26 KiB
+· c.png  已跳过：输出文件 c.png 已存在（使用 --overwrite 覆盖）
+完成：共 3 个文件，成功 2 个，跳过 1 个，失败 0 个
 ```
 
 每个文件写入后都会重新读取并验证：移除模式下，输出文件中不能残留任何元数据；写入模式下，两层都必须读出写入的内容。验证未通过的文件标记为 ✗，并列出原因。
