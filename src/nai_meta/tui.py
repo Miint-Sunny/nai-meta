@@ -3,12 +3,11 @@
 
 在终端中拖入文件，效果等同于在输入行粘贴路径（macOS 以反斜杠转义空格，Windows 加双引号）。
 因此交互模式实现为带路径补全和状态栏的输入循环：每行输入的路径按当前设置立即处理，目录先请求确认。
-以 / 开头的命令用于修改设置，退出时保存部分设置。
+以 / 开头的命令用于修改设置。开关类设置立即保存，与命令行共用；其余设置只在本次会话中有效。
 """
 from __future__ import annotations
 
 import html
-import json
 import os
 import shlex
 from collections import Counter
@@ -21,9 +20,12 @@ from prompt_toolkit.formatted_text import HTML
 from prompt_toolkit.history import FileHistory, InMemoryHistory
 from prompt_toolkit.styles import Style
 
+from . import settings
 from .core import IMG_EXTS, SYM, config_dir, iter_images
 from .nai_strip import (describe_plan, list_presets, list_words, make_opts, name_hint, resolve_poison, resolve_words,
                         strip_one, suffix_of, summary, today)
+from .trash import UNSUPPORTED as TRASH_UNSUPPORTED
+from .trash import supported as trash_supported
 
 STYLE = Style.from_dict({
     'prompt': 'bold ansicyan',
@@ -32,54 +34,35 @@ STYLE = Style.from_dict({
     'bad': 'ansired',
     'warn': 'bold ansiyellow',
 })
-# 退出时保存的设置。原地修改与试运行不保存，每次启动都从不修改源文件的状态开始
-SAVED_KEYS = ('outdir', 'suffix', 'drop_alpha', 'strip_icc', 'scrub_all', 'recursive', 'overwrite', 'rename')
 
 HELP = """\
 将图片或目录拖入终端并按回车即可处理；处理目录前会请求确认。
+标有“开关”的设置立即保存，命令行与交互模式共用；其余设置只在本次会话中有效。
 
 输出
-  /out DIR       输出到指定目录；/out - 恢复为源文件所在目录
-  /suffix SUFFIX 设置输出文件名后缀
-  /n             切换按“日期-序号”重命名（与 /i 同时开启时重命名源文件）
-  /i             切换直接修改源文件（不保留原文件）
+  /out DIR       输出到指定目录；/out - 恢复为源文件所在目录（开关）
+  /suffix SUFFIX 设置输出文件名后缀；/suffix - 恢复默认后缀（开关）
+  /n             切换按“日期-序号”重命名（开关）
+  /i             切换直接修改源文件
   /ow            切换覆盖已存在的输出文件
+
+原文件
+  /trash         切换处理后将原文件移到废纸篓，目前仅支持 macOS（开关）
 
 元数据写入
   /t SPEC        写入伪造元数据：TEXT、1（空格）、2（杂鱼）、N、edit N、@FILE、list；/t - 关闭
   /w RULE        仅替换词语：OLD=NEW、词表名称、edit NAME、list；/w - 关闭
 
 像素处理
-  /alpha         切换移除完全不透明的 alpha 通道
-  /icc           切换移除 ICC 色彩配置文件
-  /scrub         切换清零所有通道的最低位
+  /alpha         切换移除完全不透明的 alpha 通道（开关）
+  /icc           切换移除 ICC 色彩配置文件（开关）
+  /scrub         切换清零所有通道的最低位（开关）
 
 其他
-  /r             切换递归处理子目录
+  /r             切换递归处理子目录（开关）
   /dry           切换试运行
   /help          显示此帮助
   /q             退出（也可按 Ctrl-D）"""
-
-
-# ---------------------------------------------------------------- 设置的保存与读取
-def load_settings() -> dict:
-    """读取已保存的设置；文件不存在或无法解析时返回空 dict。"""
-    try:
-        d = json.loads((config_dir() / 'tui.json').read_text('utf-8'))
-        return {k: v for k, v in d.items() if k in SAVED_KEYS}
-    except Exception:
-        return {}
-
-
-def save_settings(opts) -> None:
-    """保存 SAVED_KEYS 中的设置。写入失败时不报错。"""
-    try:
-        d = config_dir()
-        d.mkdir(parents=True, exist_ok=True)
-        (d / 'tui.json').write_text(
-            json.dumps({k: getattr(opts, k) for k in SAVED_KEYS}, ensure_ascii=False, indent=1), 'utf-8')
-    except Exception:
-        pass
 
 
 # ---------------------------------------------------------------- 输入解析
@@ -120,7 +103,14 @@ def toolbar(opts) -> HTML:
         out = f'目录 {html.escape(str(opts.outdir))}' + (f'，{named}' if named else '')
     else:
         out = '源文件所在目录，' + (named or f'后缀 {html.escape(suffix_of(opts))}')
-    flags = [f'alpha：{"移除" if opts.drop_alpha else "保留"}',
+    if opts.trash:
+        original = '<warn>移到废纸篓</warn>'
+    elif opts.in_place:
+        original = '<warn>不保留</warn>'
+    else:
+        original = '保留'
+    flags = [f'原文件：{original}',
+             f'alpha：{"移除" if opts.drop_alpha else "保留"}',
              f'ICC：{"移除" if opts.strip_icc else "保留"}',
              f'递归：{"开" if opts.recursive else "关"}']
     if opts.scrub_all:
@@ -140,12 +130,16 @@ def toolbar(opts) -> HTML:
 
 # ---------------------------------------------------------------- 命令
 def _toggle(opts, key: str, label: str) -> None:
-    setattr(opts, key, not getattr(opts, key))
-    say(f'{label}：{"已开启" if getattr(opts, key) else "已关闭"}', 'dim')
+    """切换布尔设置。开关类设置（见 settings.SWITCHES）立即保存。"""
+    value = not getattr(opts, key)
+    setattr(opts, key, value)
+    if key in settings.BY_ATTR:
+        settings.set_value(key, value)
+    say(f'{label}：{"已开启" if value else "已关闭"}', 'dim')
 
 
 COMMANDS = {'/q', '/quit', '/exit', '/help', '/h', '/?', '/out', '/suffix', '/i', '/inplace', '/alpha', '/icc',
-            '/r', '/recursive', '/scrub', '/dry', '/ow', '/overwrite', '/t', '/w', '/n', '/rename'}
+            '/r', '/recursive', '/scrub', '/dry', '/ow', '/overwrite', '/t', '/w', '/n', '/rename', '/trash'}
 
 
 def is_command(line: str) -> bool:
@@ -169,9 +163,11 @@ def handle_command(line: str, opts) -> bool:
             p = parse_paths(arg)[0]
             opts.outdir, opts.in_place = str(p), False
             say(f'输出：目录 {p}' + ('' if p.is_dir() else '（不存在，将在写入时创建）'), 'dim')
+        settings.set_value('outdir', opts.outdir)
     elif cmd == '/suffix':
         if arg:
-            opts.suffix = arg
+            opts.suffix = None if arg == '-' else arg
+            settings.set_value('suffix', opts.suffix)
         say(f'后缀：{suffix_of(opts)}', 'dim')
     elif cmd == '/w':
         if arg in ('', '-'):
@@ -214,7 +210,15 @@ def handle_command(line: str, opts) -> bool:
         _toggle(opts, 'in_place', '直接修改源文件')
         if opts.in_place:
             opts.outdir = None
-            say('警告：处理后不保留原文件', 'warn')
+            if opts.trash:
+                say('原文件将先移到废纸篓，再写入处理结果', 'dim')
+            else:
+                say('警告：处理后不保留原文件（输入 /trash 改为先移到废纸篓）', 'warn')
+    elif cmd == '/trash':
+        if not opts.trash and not trash_supported():
+            say(f'错误：{TRASH_UNSUPPORTED}', 'bad')
+        else:
+            _toggle(opts, 'trash', '处理后将原文件移到废纸篓')
     elif cmd in ('/n', '/rename'):
         _toggle(opts, 'rename', '按“日期-序号”重命名')
     elif cmd == '/alpha':
@@ -279,7 +283,10 @@ def process(paths: list[Path], opts, confirm) -> None:
 
 def run_tui(argv=None) -> int:
     """运行交互模式。argv 中的第一个参数（如有）作为输出目录。"""
-    opts = make_opts(**load_settings())
+    opts = make_opts(**settings.load())
+    if opts.trash and not trash_supported():     # 设置文件可能来自其他系统
+        opts.trash = False
+        say(f'警告：{TRASH_UNSUPPORTED}，本次会话不使用废纸篓开关', 'warn')
     try:
         cfg = config_dir()
         cfg.mkdir(parents=True, exist_ok=True)
@@ -316,6 +323,5 @@ def run_tui(argv=None) -> int:
         if line.lower() in ('q', 'quit', 'exit') and not Path(line).exists():
             break
         process(parse_paths(line), opts, confirm)
-    save_settings(opts)
-    say('设置已保存', 'dim')
+    say('已退出', 'dim')
     return 0

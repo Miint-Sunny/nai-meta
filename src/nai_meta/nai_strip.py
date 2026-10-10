@@ -13,6 +13,7 @@ WebP  无损（VP8L）：按 PNG 的方式处理像素后无损重新编码。
 其他  由 Pillow 重新编码，画质会有损失。
 
 另有两种模式：``-t`` 在移除后写入伪造元数据（投毒）；``-w`` 不移除元数据，仅替换其中的指定词语后写回。
+处理成功后，原文件可以保留、移到废纸篓（``--trash``）或永久删除（``--delete``）。
 """
 from __future__ import annotations
 
@@ -24,7 +25,7 @@ import re
 import struct
 import sys
 import time
-from argparse import Namespace
+from argparse import BooleanOptionalAction, Namespace
 from collections import Counter
 from pathlib import Path
 
@@ -32,11 +33,14 @@ import numpy as np
 from PIL import Image
 from PIL.PngImagePlugin import PngInfo
 
-from . import __version__
+from . import __version__, settings
 from .argparse_zh import ArgumentParser
 from .core import (GLOB_CHARS, SYM, confirm, config_dir, embed_stealth, error, expand_comment, fill_meta,
                    find_stealth, fmt_size, is_nai, iter_images, load_meta_json, make_meta, meta_to_exif, meta_to_text,
                    parse_set, scan_png, setup_console, stealth_payload, substitute_strings, warn, wipe_stealth)
+from .trash import UNSUPPORTED as TRASH_UNSUPPORTED
+from .trash import move_to_trash
+from .trash import supported as trash_supported
 
 REPO_URL = 'https://github.com/Miint-Sunny/nai-meta'
 
@@ -309,7 +313,7 @@ def plan_webp(src: Path, im: Image.Image, opts, found: list[str], poison: dict |
 DEFAULTS = dict(paths=[], recursive=False, output=None, outdir=None, in_place=False, suffix=None,
                 drop_alpha=False, scrub_all=False, strip_icc=False, overwrite=False, no_verify=False,
                 dry_run=False, yes=False, poison=None, sets={}, poison_meta=None,
-                words=[], word_rules={}, word_presets=[], rename=False)
+                words=[], word_rules={}, word_presets=[], rename=False, trash=False, delete=False)
 
 
 def make_opts(**overrides) -> Namespace:
@@ -318,17 +322,21 @@ def make_opts(**overrides) -> Namespace:
 
 
 def describe_plan(items, opts, label: str) -> str:
-    """生成批量处理前的确认摘要，包括文件数、格式和输出位置。"""
+    """生成批量处理前的确认摘要，包括文件数、格式、输出位置和原文件的处理方式。"""
     ext = Counter(f.suffix.lower().lstrip('.') for f, _ in items)
     kinds = '、'.join(f'{k} {n}' for k, n in ext.most_common())
+    dispose = _disposal(opts)
     if opts.in_place:
-        dest = '直接修改源文件（不保留原文件）' + ('，并按“日期-序号”重命名' if opts.rename else '')
-    elif opts.output:
-        dest = f'输出到 {opts.output}'
-    elif opts.outdir:
-        dest = f'输出到目录 {opts.outdir}' + ('，按“日期-序号”命名' if opts.rename else '')
+        dest = '直接修改源文件' + ('，原文件先移到废纸篓' if dispose == 'trash' else '，不保留原文件') \
+               + ('，并按“日期-序号”重命名' if opts.rename else '')
     else:
-        dest = '输出到源文件所在目录，' + ('按“日期-序号”命名' if opts.rename else f'文件名追加 {suffix_of(opts)}')
+        if opts.output:
+            dest = f'输出到 {opts.output}'
+        elif opts.outdir:
+            dest = f'输出到目录 {opts.outdir}' + ('，按“日期-序号”命名' if opts.rename else '')
+        else:
+            dest = '输出到源文件所在目录，' + ('按“日期-序号”命名' if opts.rename else f'文件名追加 {suffix_of(opts)}')
+        dest += {'trash': '；处理后原文件移到废纸篓', 'delete': '；处理后永久删除原文件'}.get(dispose, '')
     return f'{label}：共 {len(items)} 个文件（{kinds}），{dest}'
 
 
@@ -695,15 +703,49 @@ def _removed_phrase(removed: list[str]) -> str:
     return f'已移除{" " if items[:1].isascii() else ""}{items}'
 
 
+def _disposal(opts) -> str | None:
+    """返回原文件的处理方式：``trash`` 移到废纸篓，``delete`` 删除，None 保留。
+
+    明确指定的 --delete 优先于废纸篓开关。使用 -i 且未开启废纸篓时，原文件被覆盖或删除，与 --delete 相同。
+    """
+    if opts.delete:
+        return 'delete'
+    if opts.trash:
+        return 'trash'
+    return 'delete' if opts.in_place else None
+
+
+def _disposal_text(dispose: str | None, same: bool, done: bool) -> list[str]:
+    if dispose == 'trash':
+        return ['原文件已移到废纸篓' if done else '原文件将移到废纸篓']
+    if dispose == 'delete' and not same:         # 原地覆盖时报告行已标明“原地修改”
+        return ['原文件已删除' if done else '原文件将被删除']
+    return []
+
+
+def _same_file(a: Path, b: Path) -> bool:
+    """判断两个路径是否指向同一文件，考虑相对路径、符号链接和不区分大小写的文件系统。"""
+    if a.resolve() == b.resolve():
+        return True
+    try:
+        return a.exists() and os.path.samefile(a, b)
+    except OSError:
+        return False
+
+
 def strip_one(src: Path, rel: Path, opts) -> tuple[str, str]:
     """处理单个文件。
+
+    输出先写入同目录的临时文件并验证，通过后才移到最终位置；原文件只在验证通过后才移到废纸篓或删除。
 
     Returns:
         (status, line)：status 为 ``ok``、``skip`` 或 ``fail``；line 为报告行。
     """
     name = src.name
+    tmp = None
     try:
         found, removed, actions, notes = [], [], [], []
+        src_size = src.stat().st_size
         scan = scan_png(src)
         with Image.open(src) as im:
             im.load()
@@ -718,8 +760,11 @@ def strip_one(src: Path, rel: Path, opts) -> tuple[str, str]:
                     return 'skip', f'· {name}  已跳过：未匹配任何替换规则'
                 rel = rel.with_name(substitute_strings(rel.name, opts.word_rules)[0])
             dst = output_path(src, rel, opts)
-            tag = f'{name} → {dst if opts.output or opts.outdir else dst.name}' if dst != src else f'{name}（原地修改）'
-            if dst.exists() and dst != src and not opts.overwrite:
+            same = _same_file(dst, src)
+            tag = f'{name}（原地修改）' if same else f'{name} → {dst if opts.output or opts.outdir else dst.name}'
+            if same and not opts.in_place:
+                return 'skip', f'· {name}  已跳过：输出路径与源文件相同（使用 -i 直接修改源文件）'
+            if dst.exists() and not same and not opts.overwrite:
                 return 'skip', f'· {name}  已跳过：输出文件 {dst.name} 已存在（使用 --overwrite 覆盖）'
             label = '已写回替换后的元数据' if words_meta else '已写入伪造元数据'
             if scan:
@@ -762,53 +807,78 @@ def strip_one(src: Path, rel: Path, opts) -> tuple[str, str]:
                     poison = None
                 writer = lambda p: save_pixels(clean, im, p, fmt, opts, meta=poison)  # noqa: E731
 
-        note = f'（注意：{"；".join(notes)}）' if notes else ''
+        dispose = _disposal(opts)
         if not removed and not actions:
-            if opts.in_place and dst != src:     # -i -N：没有元数据时仍执行重命名
+            if opts.in_place and not same:       # -i -n：没有元数据时只重命名，原文件内容不变
                 if opts.dry_run:
                     return 'ok', f'· {tag}  [试运行] 未检测到元数据，将重命名'
                 os.replace(src, dst)
                 return 'ok', f'{SYM["ok"]} {tag}  未检测到元数据，已重命名'
             if opts.in_place:
                 return 'skip', f'· {name}  已跳过：未检测到元数据'
-            if opts.dry_run:
-                return 'ok', f'· {tag}  [试运行] 未检测到元数据，将写出副本{note}'
-            notes.append('未检测到元数据，已写出副本')
-            note = f'（注意：{"；".join(notes)}）'
+            if not opts.dry_run:
+                notes.append('未检测到元数据，已写出副本')
+        note = f'（注意：{"；".join(notes)}）' if notes else ''
 
         if opts.dry_run:                         # 操作说明由“已…”改为“将…”
-            plan = ([_removed_phrase(removed)] if removed else []) + actions
-            return 'ok', f'· {tag}  [试运行] ' + '；'.join(x.replace('已', '将', 1) for x in plan) + note
+            plan = [_removed_phrase(removed)] if removed else ([] if actions else ['未检测到元数据，已写出副本'])
+            plan = [x.replace('已', '将', 1) for x in plan + actions] + _disposal_text(dispose, same, done=False)
+            return 'ok', f'· {tag}  [试运行] ' + '；'.join(plan) + note
 
         dst.parent.mkdir(parents=True, exist_ok=True)
-        tmp = dst.with_name(dst.name + '.tmp~')
+        tmp = dst.with_name(f'.{dst.stem}.tmp{dst.suffix}')   # 以 . 开头，处理目录时不会被当作输入
         writer(tmp)
-        os.replace(tmp, dst)
-
         if opts.no_verify:
             problems = []
         elif poison:
-            problems = verify_poison(dst, poison)
+            problems = verify_poison(tmp, poison)
             if words_meta is not None:
-                problems += verify_words(dst, opts.word_rules)
+                problems += verify_words(tmp, opts.word_rules)
         else:
-            problems = verify(dst)
-        size = f'{fmt_size(src.stat().st_size)} → {fmt_size(dst.stat().st_size)}' if dst != src else fmt_size(dst.stat().st_size)
-        if opts.in_place and dst != src:         # -i -N：新文件已写入，删除源文件
-            src.unlink()
+            problems = verify(tmp)
+        if problems and same:
+            return 'fail', f'{SYM["bad"]} {tag}  验证失败：{"；".join(problems)}；源文件未修改{note}'
+
+        if same and dispose == 'trash':
+            try:
+                move_to_trash(src)
+            except OSError as e:
+                return 'fail', f'{SYM["bad"]} {tag}  无法将原文件移到废纸篓：{e}；源文件未修改{note}'
+            try:
+                os.replace(tmp, dst)
+            except OSError as e:
+                return 'fail', f'{SYM["bad"]} {tag}  原文件已移到废纸篓，但写入失败：{e}；可从废纸篓恢复原文件'
+        else:
+            os.replace(tmp, dst)
+        tmp = None
+        out_size = dst.stat().st_size
+        size = fmt_size(out_size) if same else f'{fmt_size(src_size)} → {fmt_size(out_size)}'
         if problems:
-            return 'fail', f'{SYM["bad"]} {tag}  验证失败：{"；".join(problems)}；{size}{note}'
+            return 'fail', f'{SYM["bad"]} {tag}  验证失败：{"；".join(problems)}；原文件已保留；{size}{note}'
+
+        if not same and dispose == 'trash':
+            try:
+                move_to_trash(src)
+            except OSError as e:
+                return 'fail', f'{SYM["bad"]} {tag}  已写出输出文件，但无法将原文件移到废纸篓：{e}；原文件已保留{note}'
+        elif not same and dispose == 'delete':
+            src.unlink()
+
         if words_meta is not None:
             parts = ['已替换 ' + '、'.join(f'{k} ×{n}' for k, n in hits.items())]
         else:
             parts = [_removed_phrase(removed)] if removed else []
-        return 'ok', f'{SYM["ok"]} {tag}  ' + '；'.join(parts + actions + [size]) + note
+        parts += actions + _disposal_text(dispose, same, done=True) + [size]
+        return 'ok', f'{SYM["ok"]} {tag}  ' + '；'.join(parts) + note
     except Exception as e:
         return 'fail', f'{SYM["bad"]} {name}  处理失败：{e}'
+    finally:
+        if tmp is not None and tmp.exists():     # 只清理本次创建的临时文件
+            tmp.unlink()
 
 
 def name_hint(items, opts) -> tuple[str, str] | None:
-    """文件名为 NovelAI 默认格式且未使用 ``-N`` 时，返回 (警告, 提示)；否则返回 None。"""
+    """文件名为 NovelAI 默认格式且未使用 ``-n`` 时，返回 (警告, 提示)；否则返回 None。"""
     if opts.rename or opts.output:
         return None
     n = sum(bool(NAI_NAME.search(src.stem)) for src, _ in items)
@@ -816,7 +886,7 @@ def name_hint(items, opts) -> tuple[str, str] | None:
         return None
     who = '该文件' if len(items) == 1 else f'{n} 个文件'
     return (f'{who}使用 NovelAI 默认文件名（以提示词开头、以 s-<种子> 结尾），移除元数据后文件名中仍保留这些信息',
-            f'使用 -N 将输出文件重命名为“日期-序号”格式，如 {today()}-0001')
+            f'使用 -n 将输出文件重命名为“日期-序号”格式，如 {today()}-0001')
 
 
 def summary(counts: Counter) -> str:
@@ -826,52 +896,95 @@ def summary(counts: Counter) -> str:
 
 
 # ---------------------------------------------------------------- 命令行
-EPILOG = f'''\
+def _table(rows: list[tuple[str, str]], indent: int = 2) -> str:
+    width = max(len(a) for a, _ in rows) + 2
+    return '\n'.join(f'{" " * indent}{a:<{width}}{b}' for a, b in rows)
+
+
+def _epilog() -> str:
+    t_values = _table([
+        ('TEXT', '所有字段写入该文本'),
+        ('1', '内置预设“空格”：所有字段写入 512 个半角空格'),
+        ('2', '内置预设“杂鱼”：所有字段写入“杂鱼~♥”×64'),
+        ('N', '用户预设（编号或名称）'),
+        ('edit [N]', '在终端中编辑，并保存为预设 N'),
+        ('@FILE', '使用 JSON 模板'),
+        ('list', '列出预设'),
+    ])
+    w_values = _table([
+        ('OLD=NEW', '单条替换规则'),
+        ('NAME', '词表，内置 discord（loli→1011）'),
+        ('edit NAME', '在终端中编辑词表'),
+        ('list', '列出词表'),
+    ])
+    switch_cmds = _table([
+        ('nais config', '列出全部开关及当前值'),
+        ('nais config KEY VALUE', '设置开关，例如 nais config trash on'),
+        ('nais config KEY -', '恢复默认值'),
+    ])
+    examples = _table([
+        ('nais a.png', '输出 a_clean.png'),
+        ('nais -i *.png', '直接修改源文件'),
+        ('nais -r ./in -d ./out', '递归处理目录，结果写入 ./out'),
+        ('nais a.png -n', f'输出为 {today()}-0001.png'),
+        ('nais ./in -d ./out --trash', '处理后将原文件移到废纸篓'),
+        ('nais a.png -t 2', '移除元数据后写入内置预设 2'),
+        ('nais a.png -w discord', '仅替换词表 discord 中的词语'),
+        ('nais -s ./in', '试运行，只报告将执行的操作'),
+        ('nais tui [DIR]', '进入交互模式，DIR 为输出目录'),
+    ])
+    return f'''\
 -t 的取值：
-  TEXT       所有字段写入该文本
-  1          内置预设“空格”：所有字段写入 512 个半角空格
-  2          内置预设“杂鱼”：所有字段写入“杂鱼~♥”×64
-  N          用户预设（编号或名称）
-  edit [N]   在终端中编辑，并保存为预设 N
-  @FILE      使用 JSON 模板
-  list       列出预设
+{t_values}
 
 -w 的取值（可重复，规则依次合并）：
-  OLD=NEW    单条替换规则
-  NAME       词表，内置 discord（loli→1011）
-  edit NAME  在终端中编辑词表
-  list       列出词表
+{w_values}
+
+开关：
+  标有“开关”的选项可以保存为默认值，命令行与交互模式共用。命令行中指定的选项优先于开关；
+  布尔开关可用对应的 --no- 选项在单次运行中关闭，例如 --no-trash。
+{switch_cmds}
+  设置文件：{settings.settings_path()}
 
 示例：
-  nais a.png                 输出 a_clean.png
-  nais -i *.png              直接修改源文件
-  nais -r ./in -d ./out      递归处理目录，结果写入 ./out
-  nais a.png -N              输出为 {today()}-0001.png
-  nais a.png -t 2            移除元数据后写入内置预设 2
-  nais a.png -w discord      仅替换词表 discord 中的词语
-  nais tui [DIR]             进入交互模式，DIR 为输出目录
+{examples}
 
 文档：{REPO_URL}'''
 
 
-def build_parser(prog: str) -> ArgumentParser:
+def build_parser(prog: str, cfg: dict) -> ArgumentParser:
+    """创建 nais 的参数解析器。cfg 为已保存的开关，用于在帮助中显示当前取值。"""
+    def sw(attr: str) -> str:
+        return f'（开关，当前：{settings.describe(attr, cfg[attr])}）'
+
     ap = ArgumentParser(
         prog=prog,
         description='移除 NovelAI 图片中的元数据（PNG 文本块、EXIF 与 LSB 隐写），不修改像素数据。\n'
                     '也可在移除后写入伪造元数据（-t），或仅替换元数据中的指定词语（-w）。',
-        epilog=EPILOG, add_help=False)
+        epilog=_epilog(), add_help=False)
     ap.add_argument('paths', nargs='*', metavar='PATH', help='图片文件或目录，支持通配符')
 
     g = ap.add_argument_group('输出')
     dest = g.add_mutually_exclusive_group()
     dest.add_argument('-o', '--output', metavar='FILE', help='输出文件，仅适用于单个输入文件')
-    dest.add_argument('-d', '--outdir', metavar='DIR', help='输出目录；输入为目录时保留相对路径')
-    dest.add_argument('-i', '--in-place', action='store_true', help='直接修改源文件，不保留原文件')
+    dest.add_argument('-d', '--outdir', metavar='DIR',
+                      help='输出目录；输入为目录时保留相对路径。DIR 为 - 时输出到源文件所在目录' + sw('outdir'))
+    dest.add_argument('-i', '--in-place', action='store_true',
+                      help='直接修改源文件。开启 --trash 时原文件先移到废纸篓，否则原文件被覆盖，无法恢复')
     g.add_argument('--suffix', metavar='SUFFIX',
-                   help='输出到源文件所在目录时追加的文件名后缀（默认：_clean；使用 -t 时为 _poison；使用 -w 时为词表名或 _w）')
-    g.add_argument('-N', '--rename', action='store_true',
-                   help='按“日期-序号”重命名输出文件（如 20260929-0001），序号接续目标目录中当天已有的编号；与 -i 同用时重命名源文件')
+                   help='输出到源文件所在目录时追加的文件名后缀（默认：_clean；使用 -t 时为 _poison；'
+                        '使用 -w 时为词表名或 _w）。SUFFIX 为 - 时使用默认后缀' + sw('suffix'))
+    g.add_argument('-n', '--rename', action=BooleanOptionalAction, default=None,
+                   help=f'按“日期-序号”重命名输出文件（如 {today()}-0001），序号接续目标目录中当天已有的编号；'
+                        '与 -i 同用时重命名源文件' + sw('rename'))
     g.add_argument('--overwrite', action='store_true', help='覆盖已存在的输出文件（默认：跳过）')
+
+    g = ap.add_argument_group('原文件')
+    g.add_argument('--trash', action=BooleanOptionalAction, default=None,
+                   help='处理成功并通过验证后，将原文件移到废纸篓；与 -i 同用时，原文件先移到废纸篓再写入。'
+                        '目前仅支持 macOS' + sw('trash'))
+    g.add_argument('--delete', action='store_true',
+                   help='处理成功并通过验证后，永久删除原文件，无法恢复。只能逐次指定，不能设为开关')
 
     g = ap.add_argument_group('元数据写入')
     g.add_argument('-t', '--poison', metavar='SPEC', help='移除元数据后写入伪造元数据（投毒），取值见下文')
@@ -881,18 +994,48 @@ def build_parser(prog: str) -> ArgumentParser:
                    help='不移除元数据，仅替换其中的词语后写回明文层与隐写层，文件名中的词语一并替换；取值见下文')
 
     g = ap.add_argument_group('像素处理')
-    g.add_argument('--drop-alpha', action='store_true', help='alpha 通道完全不透明时将其移除，输出 RGB 图像')
-    g.add_argument('--scrub-all', action='store_true', help='清零所有通道的最低位，用于处理未知格式的隐写（各分量最多变化 1）')
-    g.add_argument('--strip-icc', action='store_true', help='同时移除 ICC 色彩配置文件（默认：保留）')
+    g.add_argument('--drop-alpha', action=BooleanOptionalAction, default=None,
+                   help='alpha 通道完全不透明时将其移除，输出 RGB 图像' + sw('drop_alpha'))
+    g.add_argument('--scrub-all', action=BooleanOptionalAction, default=None,
+                   help='清零所有通道的最低位，用于处理未知格式的隐写，各分量最多变化 1' + sw('scrub_all'))
+    g.add_argument('--strip-icc', action=BooleanOptionalAction, default=None,
+                   help='同时移除 ICC 色彩配置文件' + sw('strip_icc'))
 
     g = ap.add_argument_group('其他')
     g.add_argument('-h', '--help', action='help', help='显示此帮助信息并退出')
-    g.add_argument('-r', '--recursive', action='store_true', help='递归处理子目录')
-    g.add_argument('-n', '--dry-run', action='store_true', help='试运行：报告将执行的操作，不写入文件')
+    g.add_argument('-r', '--recursive', action=BooleanOptionalAction, default=None,
+                   help='递归处理子目录' + sw('recursive'))
+    g.add_argument('-s', '--dry-run', action='store_true', help='试运行：报告将执行的操作，不写入文件')
     g.add_argument('-y', '--yes', action='store_true', help='处理目录或通配符时不请求确认')
     g.add_argument('--no-verify', action='store_true', help='跳过写入后的回读验证')
     g.add_argument('-V', '--version', action='version', version=f'nai-meta {__version__}', help='显示版本信息并退出')
     return ap
+
+
+def apply_settings(a, cfg: dict) -> list[str]:
+    """用已保存的开关填充命令行中未指定的选项。
+
+    明确指定的选项不受开关影响；``-d -`` 与 ``--suffix -`` 表示本次使用内置默认值。
+    已指定 -o 或 -i 时不使用默认输出目录，已指定 -o 时不按日期重命名，已指定 --delete 时不使用废纸篓开关。
+
+    Returns:
+        取自开关的属性名。
+    """
+    applied = []
+    for sw in settings.SWITCHES:
+        attr, value = sw.attr, getattr(a, sw.attr)
+        if value == '-':
+            setattr(a, attr, None)
+            continue
+        if value is not None:
+            continue
+        if (attr == 'outdir' and (a.output or a.in_place)) or (attr == 'rename' and a.output) \
+                or (attr == 'trash' and a.delete):
+            setattr(a, attr, sw.default)
+            continue
+        setattr(a, attr, cfg.get(attr, sw.default))
+        applied.append(attr)
+    return applied
 
 
 def _pull_edit_name(a, attr: str) -> None:
@@ -922,10 +1065,23 @@ def main(argv=None, prog: str | None = None) -> int:
     if argv and argv[0] == 'tui':
         from .tui import run_tui
         return run_tui(argv[1:])
-    a = build_parser(prog).parse_intermixed_args(argv)
+    if argv and argv[0] == 'config':
+        return settings.config_main(argv[1:], prog=f'{prog} config')
+    cfg = settings.load()
+    a = build_parser(prog, cfg).parse_intermixed_args(argv)
     a.sets = a.set
     if a.words and a.poison:
         error('-w 与 -t 不能同时使用')
+        return 1
+    if a.delete and a.trash:
+        error('--delete 不能与 --trash 同时使用')
+        return 1
+    if a.output and a.rename:
+        error('-o 不能与 -n 同时使用')
+        return 1
+    applied = apply_settings(a, cfg)
+    if a.trash and not trash_supported():
+        error(TRASH_UNSUPPORTED, f'本次运行可使用 --no-trash，或执行 {prog} config trash off 关闭废纸篓开关')
         return 1
     _pull_edit_name(a, 'words')
     _pull_edit_name(a, 'poison')
@@ -948,9 +1104,10 @@ def main(argv=None, prog: str | None = None) -> int:
     if a.output and len(items) > 1:
         error('-o 只能用于单个输入文件', '处理多个文件时，使用 -d DIR 指定输出目录')
         return 1
-    if a.output and a.rename:
-        error('-o 不能与 -N 同时使用')
-        return 1
+    used = settings.active_from_file(applied, a)
+    if used:                                      # 开关可能早已设置，运行前列出，避免遗忘
+        sys.stdout.flush()
+        print(f'已启用的开关：{"、".join(used)}（使用 {prog} config 查看或修改）', file=sys.stderr)
     # 目录与通配符属于批量操作，处理前请求确认；逐个指定的文件不确认
     batch = [p for p in a.paths if Path(p).is_dir() or any(ch in p for ch in GLOB_CHARS)]
     if batch and not a.yes and not a.dry_run:

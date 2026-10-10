@@ -90,7 +90,7 @@ def wrap(text: str, width: int) -> list[str]:
 class HelpFormatter(argparse.RawDescriptionHelpFormatter):
     """选项说明按显示宽度折行；description 与 epilog 保留原有换行。"""
 
-    def __init__(self, prog: str, indent_increment: int = 2, max_help_position: int = 30, width: int | None = None):
+    def __init__(self, prog: str, indent_increment: int = 2, max_help_position: int = 36, width: int | None = None):
         if width is None:
             width = min(shutil.get_terminal_size((100, 24)).columns, 100) - 2
         super().__init__(prog, indent_increment, max_help_position, width)

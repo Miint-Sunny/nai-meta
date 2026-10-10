@@ -16,10 +16,10 @@ def test_dispatch(tmp_path, capsys):
     _png(p)
     assert nai(['i', str(p)]) == 0
     assert 'a.png' in capsys.readouterr().out
-    assert nai(['s', '-n', str(p)]) == 0
+    assert nai(['s', '-s', str(p)]) == 0
     assert '试运行' in capsys.readouterr().out
     assert nai(['inspect', '-j', str(p)]) == 0
-    assert nai(['strip', '-n', str(p)]) == 0
+    assert nai(['strip', '-s', str(p)]) == 0
 
 
 def test_dispatch_errors(capsys):

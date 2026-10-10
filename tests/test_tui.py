@@ -49,7 +49,7 @@ def test_tui_drag_file_and_folder_with_confirm(tmp_path, cfg):
     # 设置输出目录，拖入单个文件，拖入目录并拒绝，再次拖入目录并确认，然后退出
     assert drive(f'/out {q(str(out))}\n{q(str(d / "a.png"))}\n{q(str(d))}\nn\n{q(str(d))}\ny\n/q\n') == 0
     assert (out / 'a.png').exists() and (out / 'b.png').exists()
-    saved = json.loads((cfg / 'tui.json').read_text('utf-8'))
+    saved = json.loads((cfg / 'settings.json').read_text('utf-8'))
     assert saved['outdir'] == str(out) and saved['suffix'] is None      # 未设置后缀时保存为 None，由是否写入伪造元数据决定默认后缀
     # 重新启动后保留输出目录；/out - 恢复为输出到源文件所在目录
     nai_png(d / 'c.png')
