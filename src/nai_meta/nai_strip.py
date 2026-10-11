@@ -336,6 +336,8 @@ def describe_plan(items, opts, label: str) -> str:
             dest = f'输出到目录 {opts.outdir}' + ('，按“日期-序号”命名' if opts.rename else '')
         else:
             dest = '输出到源文件所在目录，' + ('按“日期-序号”命名' if opts.rename else f'文件名追加 {suffix_of(opts)}')
+        if opts.overwrite:
+            dest += '；覆盖已存在的输出文件' + ('，被覆盖的文件先移到废纸篓' if trash_supported() else '')
         dest += {'trash': '；处理后原文件移到废纸篓', 'delete': '；处理后永久删除原文件'}.get(dispose, '')
     return f'{label}：共 {len(items)} 个文件（{kinds}），{dest}'
 
@@ -723,6 +725,13 @@ def _disposal_text(dispose: str | None, same: bool, done: bool) -> list[str]:
     return []
 
 
+def _overwrite_text(dst: Path, done: bool) -> str:
+    """覆盖已有输出文件时的说明。支持废纸篓的系统先将被覆盖的文件移到废纸篓，其他系统直接覆盖。"""
+    if trash_supported():
+        return f'被覆盖的 {dst.name} {"已" if done else "将"}移到废纸篓'
+    return f'{"已" if done else "将"}覆盖 {dst.name}'
+
+
 def _same_file(a: Path, b: Path) -> bool:
     """判断两个路径是否指向同一文件，考虑相对路径、符号链接和不区分大小写的文件系统。"""
     if a.resolve() == b.resolve():
@@ -764,6 +773,8 @@ def strip_one(src: Path, rel: Path, opts) -> tuple[str, str]:
             tag = f'{name}（原地修改）' if same else f'{name} → {dst if opts.output or opts.outdir else dst.name}'
             if same and not opts.in_place:
                 return 'skip', f'· {name}  已跳过：输出路径与源文件相同（使用 -i 直接修改源文件）'
+            if dst.is_dir():
+                return 'fail', f'{SYM["bad"]} {name}  输出路径是目录：{dst}'
             if dst.exists() and not same and not opts.overwrite:
                 return 'skip', f'· {name}  已跳过：输出文件 {dst.name} 已存在（使用 --overwrite 覆盖）'
             label = '已写回替换后的元数据' if words_meta else '已写入伪造元数据'
@@ -822,7 +833,10 @@ def strip_one(src: Path, rel: Path, opts) -> tuple[str, str]:
 
         if opts.dry_run:                         # 操作说明由“已…”改为“将…”
             plan = [_removed_phrase(removed)] if removed else ([] if actions else ['未检测到元数据，已写出副本'])
-            plan = [x.replace('已', '将', 1) for x in plan + actions] + _disposal_text(dispose, same, done=False)
+            plan = [x.replace('已', '将', 1) for x in plan + actions]
+            if not same and dst.exists():
+                plan.append(_overwrite_text(dst, done=False))
+            plan += _disposal_text(dispose, same, done=False)
             return 'ok', f'· {tag}  [试运行] ' + '；'.join(plan) + note
 
         dst.parent.mkdir(parents=True, exist_ok=True)
@@ -836,9 +850,14 @@ def strip_one(src: Path, rel: Path, opts) -> tuple[str, str]:
                 problems += verify_words(tmp, opts.word_rules)
         else:
             problems = verify(tmp)
-        if problems and same:
-            return 'fail', f'{SYM["bad"]} {tag}  验证失败：{"；".join(problems)}；源文件未修改{note}'
+        replacing = not same and os.path.lexists(dst)
+        if replacing and not opts.overwrite:     # 处理期间出现了同名文件：未指定 --overwrite 时不覆盖
+            return 'skip', f'· {name}  已跳过：输出文件 {dst.name} 已存在（使用 --overwrite 覆盖）'
+        if problems and (same or replacing):     # 验证未通过时不改动已有文件
+            kept = '源文件未修改' if same else f'未覆盖 {dst.name}'
+            return 'fail', f'{SYM["bad"]} {tag}  验证失败：{"；".join(problems)}；{kept}{note}'
 
+        replaced = ''
         if same and dispose == 'trash':
             try:
                 move_to_trash(src)
@@ -849,7 +868,20 @@ def strip_one(src: Path, rel: Path, opts) -> tuple[str, str]:
             except OSError as e:
                 return 'fail', f'{SYM["bad"]} {tag}  原文件已移到废纸篓，但写入失败：{e}；可从废纸篓恢复原文件'
         else:
-            os.replace(tmp, dst)
+            if replacing and trash_supported():  # 覆盖前先将被覆盖的文件移到废纸篓，移动失败则不覆盖
+                try:
+                    move_to_trash(dst)
+                except OSError as e:
+                    return 'fail', f'{SYM["bad"]} {tag}  无法将被覆盖的 {dst.name} 移到废纸篓：{e}；未覆盖{note}'
+            try:
+                os.replace(tmp, dst)
+            except OSError as e:
+                if replacing and trash_supported():
+                    return 'fail', (f'{SYM["bad"]} {tag}  被覆盖的 {dst.name} 已移到废纸篓，但写入失败：{e}；'
+                                    '可从废纸篓恢复')
+                raise
+            if replacing:
+                replaced = _overwrite_text(dst, done=True)
         tmp = None
         out_size = dst.stat().st_size
         size = fmt_size(out_size) if same else f'{fmt_size(src_size)} → {fmt_size(out_size)}'
@@ -868,7 +900,7 @@ def strip_one(src: Path, rel: Path, opts) -> tuple[str, str]:
             parts = ['已替换 ' + '、'.join(f'{k} ×{n}' for k, n in hits.items())]
         else:
             parts = [_removed_phrase(removed)] if removed else []
-        parts += actions + _disposal_text(dispose, same, done=True) + [size]
+        parts += actions + ([replaced] if replaced else []) + _disposal_text(dispose, same, done=True) + [size]
         return 'ok', f'{SYM["ok"]} {tag}  ' + '；'.join(parts) + note
     except Exception as e:
         return 'fail', f'{SYM["bad"]} {name}  处理失败：{e}'
@@ -977,7 +1009,8 @@ def build_parser(prog: str, cfg: dict) -> ArgumentParser:
     g.add_argument('-n', '--rename', action=BooleanOptionalAction, default=None,
                    help=f'按“日期-序号”重命名输出文件（如 {today()}-0001），序号接续目标目录中当天已有的编号；'
                         '与 -i 同用时重命名源文件' + sw('rename'))
-    g.add_argument('--overwrite', action='store_true', help='覆盖已存在的输出文件（默认：跳过）')
+    g.add_argument('--overwrite', action='store_true',
+                   help='覆盖已存在的输出文件，被覆盖的文件先移到废纸篓；不支持废纸篓的系统上直接覆盖（默认：跳过）')
 
     g = ap.add_argument_group('原文件')
     g.add_argument('--trash', action=BooleanOptionalAction, default=None,

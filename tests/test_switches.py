@@ -198,9 +198,66 @@ def test_original_kept_when_verification_or_trash_fails(cfg, pics, trash, monkey
     monkeypatch.setenv('XDG_CONFIG_HOME', str(cfg.parent))
     assert strip_main([str(a), '-i', '--trash']) == 1                    # 移到废纸篓失败：源文件不变
     assert a.read_bytes() == raw
-    assert strip_main([str(a), '--trash', '--overwrite']) == 1           # 输出已写出，但原文件保留
+    (pics / 'a_clean.png').unlink()                                      # 删除前一步留下的输出，避免触发覆盖
+    assert strip_main([str(a), '--trash']) == 1                          # 输出已写出，但原文件无法移到废纸篓：原文件保留
     assert a.exists() and (pics / 'a_clean.png').exists()
     assert not list(pics.glob('.*'))
+
+
+# ---------------------------------------------------------------- 覆盖已有输出文件
+def test_overwrite_moves_old_output_to_trash(cfg, pics, trash, capsys):
+    a, old = pics / 'a.png', pics / 'a_clean.png'
+    nai_png(a)
+    old.write_bytes(b'old output')
+    assert strip_main([str(a), '--overwrite', '-s']) == 0                # 试运行：只报告，不移动
+    assert old.read_bytes() == b'old output' and not trash
+    assert '被覆盖的 a_clean.png 将移到废纸篓' in capsys.readouterr().out
+    assert strip_main([str(a), '--overwrite']) == 0
+    assert [p.name for p in trash] == ['a_clean.png'] and trash[0].read_bytes() == b'old output'
+    assert clean(old) and a.exists()                                     # 新输出就位，原文件保留
+    assert '被覆盖的 a_clean.png 已移到废纸篓' in capsys.readouterr().out
+    assert strip_main([str(a), '--overwrite', '--trash']) == 0           # 与 --trash 同用：两者都进废纸篓
+    assert [p.name for p in trash][1:] == ['a_clean.png', 'a.png'] and not a.exists()
+
+
+def test_overwrite_skipped_when_trash_or_verification_fails(cfg, pics, monkeypatch, capsys):
+    a, old = pics / 'a.png', pics / 'a_clean.png'
+    nai_png(a)
+    old.write_bytes(b'old output')
+
+    def fail(path):
+        raise OSError('测试：无法移动')
+    monkeypatch.setattr(ns, 'trash_supported', lambda: True)
+    monkeypatch.setattr(ns, 'move_to_trash', fail)
+    assert strip_main([str(a), '--overwrite']) == 1                      # 无法移到废纸篓：不覆盖，计为失败
+    assert old.read_bytes() == b'old output' and '未覆盖' in capsys.readouterr().out
+    assert not list(pics.glob('.*'))
+    calls = []
+    monkeypatch.setattr(ns, 'move_to_trash', calls.append)
+    monkeypatch.setattr(ns, 'verify', lambda p: ['输出文件仍含 测试'])
+    assert strip_main([str(a), '--overwrite']) == 1                      # 验证失败：已有文件不动
+    assert old.read_bytes() == b'old output' and not calls
+
+
+def test_overwrite_without_trash_support_replaces_directly(cfg, pics, monkeypatch, capsys):
+    for mod in (ns, st, tui):
+        monkeypatch.setattr(mod, 'trash_supported', lambda: False)
+    calls = []
+    monkeypatch.setattr(ns, 'move_to_trash', calls.append)
+    a, old = pics / 'a.png', pics / 'a_clean.png'
+    nai_png(a)
+    old.write_bytes(b'old output')
+    assert strip_main([str(a), '--overwrite']) == 0
+    assert clean(old) and not calls and '已覆盖 a_clean.png' in capsys.readouterr().out
+
+
+def test_output_directory_is_never_overwritten(cfg, pics, trash):
+    a, d = pics / 'a.png', pics / 'out.png'
+    nai_png(a)
+    d.mkdir()
+    (d / 'keep.txt').write_text('keep', 'utf-8')
+    assert strip_main([str(a), '-o', str(d), '--overwrite']) == 1        # 输出路径是目录：报错，目录不动
+    assert (d / 'keep.txt').exists() and not trash
 
 
 def test_output_path_equal_to_source_is_refused(cfg, pics):
